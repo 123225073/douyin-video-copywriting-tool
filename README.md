@@ -173,6 +173,6 @@ prototype/local-data/
 | 项目 | 内容 |
 | --- | --- |
 | Repository | `123225073/douyin-video-copywriting-tool` |
-| Visibility | Private |
+| Visibility | Public |
 | Description | 本地运行的抖音视频解析、字幕/OCR 文案提取、SRT 生成与 CPA AI 改写工具。 |
 | Topics | `douyin`, `video-downloader`, `ocr`, `subtitle-extraction`, `srt`, `ai-copywriting`, `react`, `express`, `opencv`, `rapidocr`, `local-tool` |
