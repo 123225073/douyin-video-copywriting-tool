@@ -1,0 +1,60 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment and local credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Node dependencies and local package cache
+node_modules/
+**/node_modules/
+.npm-cache/
+**/.npm-cache/
+.npmrc
+**/.npmrc
+
+# Build outputs
+dist/
+**/dist/
+build/
+**/build/
+
+# Runtime data, uploaded videos, cookies, OCR outputs, and local settings
+local-data/
+**/local-data/
+
+# QA/browser artifacts
+qa-screenshots/
+**/qa-screenshots/
+playwright-report/
+test-results/
+
+# Logs
+*.log
+*.out
+*.err
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Large local media files should stay out of Git by default
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.m4a
