@@ -9,7 +9,8 @@
 - 快速抽帧：通过后端抽帧，不需要等待视频完整播放。
 - 抽帧模式：支持全帧抽取，也支持手动设置抽帧频率。
 - 画面文案识别：适合无声视频、只有音效的视频、屏幕字幕视频。
-- 语音文案识别：适合有配音、有口播的视频。
+- 本地语音文案识别：内置 `faster-whisper` 转写，适合有配音、有口播的视频。
+- 本机配置推荐：检测 CPU、内存、显卡和 Python 依赖，推荐合适的本地语音识别模型。
 - 水印过滤：尽量排除 Logo、水印、平台标识等无关区域，减少误识别。
 - 文案整理：自动去重、合并、清洗识别结果。
 - SRT 导出：生成带时间线的字幕文件。
@@ -28,6 +29,7 @@
 - 后端：Node.js + Express
 - 视频处理：Python + OpenCV
 - OCR：RapidOCR
+- ASR：faster-whisper
 - AI 接口：CPA/OpenAI 兼容接口
 
 ## 目录结构
@@ -44,6 +46,7 @@
 │   ├── src/
 │   └── scripts/
 │       ├── extract_frames.py
+│       ├── transcribe_media.py
 │       └── video_ocr.py
 └── .gitignore
 ```
@@ -56,8 +59,22 @@
 - Python 依赖：
 
 ```bash
-pip install opencv-python rapidocr_onnxruntime
+pip install opencv-python rapidocr_onnxruntime faster-whisper
 ```
+
+首次运行本地语音识别时，`faster-whisper` 会下载模型；如果要打包给他人离线使用，需要提前准备模型缓存。
+
+本地语音识别模型建议：
+
+| 模型 | 适合电脑 | 说明 |
+| --- | --- | --- |
+| `tiny` | 低配电脑 | 速度最快，准确率最低 |
+| `base` | 普通办公电脑 | 轻量稳定 |
+| `small` | 大多数电脑 | 默认均衡方案 |
+| `medium` | 高内存 / 高配 CPU / 6GB 以上 NVIDIA 显卡 | 准确率更好，速度更慢 |
+| `large-v3` | 10GB 以上 NVIDIA 显卡或很高配电脑 | 准确率更高，资源消耗最大 |
+
+工具的 AI 设置页里有“检测配置”按钮，可自动给出推荐模型。
 
 ## 安装和启动
 
@@ -158,14 +175,15 @@ prototype/local-data/
 - 抖音真实视频解析流程已测试。
 - 后端快速抽帧已接入。
 - 本地视频上传入口已接入。
-- OCR 文案识别和 SRT 生成已接入。
+- 本地语音识别、OCR 文案识别和 SRT 生成已接入。
 - CPA/OpenAI 兼容模型配置入口已接入。
 
 ## 已知限制
 
 - 抖音链接解析受平台风控影响，某些链接可能需要本机浏览器 Cookie 辅助。
-- 语音转文字需要兼容的音频转写接口或本地 ASR 能力。
-- 如果 CPA 接口不支持 `/audio/transcriptions`，语音识别会失败。
+- 语音转文字优先使用本地 `faster-whisper`；如果本地依赖或模型不可用，才会尝试 CPA 音频转写兜底。
+- CPA 兜底要求接口明确支持音频转写；普通语言模型或生图模型通常不能识别音频。
+- 新电脑首次使用本地语音识别，可能需要等待模型下载。
 - 全帧抽取对长视频会消耗较多时间和算力。
 
 ## 仓库信息

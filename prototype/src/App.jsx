@@ -45,17 +45,24 @@ const DEFAULT_SETTINGS = {
   apiKeySaved: false,
   douyinCookie: "",
   douyinCookieSaved: false,
-  parserApiTemplate: "",
-  parserApiKey: "",
-  parserApiKeySaved: false,
   model: "",
-  transcriptionModel: "whisper-1",
+  transcriptionModel: "Systran/faster-whisper-small",
   models: [],
 };
+
+const ASR_MODEL_OPTIONS = [
+  { value: "Systran/faster-whisper-tiny", label: "faster-whisper-tiny", hint: "低配可用，速度最快" },
+  { value: "Systran/faster-whisper-base", label: "faster-whisper-base", hint: "轻量，普通电脑更稳" },
+  { value: "Systran/faster-whisper-small", label: "faster-whisper-small", hint: "默认均衡" },
+  { value: "Systran/faster-whisper-medium", label: "faster-whisper-medium", hint: "更准，但更慢" },
+  { value: "large-v3", label: "faster-whisper-large-v3", hint: "高配电脑/显卡优先" },
+];
 
 function App() {
   const videoRef = useRef(null);
   const fileInputRef = useRef(null);
+  const noticeTimerRef = useRef(null);
+  const resolveAutoCloseTimerRef = useRef(null);
   const [douyinUrl, setDouyinUrl] = useState("");
   const [media, setMedia] = useState(null);
   const [metadata, setMetadata] = useState(null);
@@ -65,6 +72,8 @@ function App() {
   const [stripWatermarks, setStripWatermarks] = useState(true);
   const [frames, setFrames] = useState([]);
   const [transcript, setTranscript] = useState("");
+  const [asrArtifacts, setAsrArtifacts] = useState(null);
+  const [asrSubtitleCount, setAsrSubtitleCount] = useState(0);
   const [visualText, setVisualText] = useState("");
   const [tags, setTags] = useState([]);
   const [ocrArtifacts, setOcrArtifacts] = useState(null);
@@ -77,10 +86,11 @@ function App() {
   const [settingsDraft, setSettingsDraft] = useState(DEFAULT_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsNotice, setSettingsNotice] = useState("");
+  const [asrProfile, setAsrProfile] = useState(null);
   const [resolveSteps, setResolveSteps] = useState([]);
   const [resolvePanelOpen, setResolvePanelOpen] = useState(false);
   const [busy, setBusy] = useState("");
-  const [notice, setNotice] = useState("");
+  const [notice, setNoticeState] = useState("");
   const [activeTab, setActiveTab] = useState("timeline");
   const [logs, setLogs] = useState(["等待输入抖音链接，或上传本地视频开始。"]);
   const [stepState, setStepState] = useState({
@@ -99,15 +109,69 @@ function App() {
   const effectiveFps = frameInfo?.fps || media?.fps || 0;
   const effectiveFrameCount = frameInfo?.frameCount || media?.frameCount || 0;
   const expectedFrameCount = estimateCaptureCount({ mode: frameMode, duration: metadata?.duration, fps: effectiveFps, frameCount: effectiveFrameCount, interval: sampleInterval });
+  const asrSrtUrl = asrArtifacts?.srt;
   const ocrSrtUrl = ocrArtifacts?.srt;
 
   useEffect(() => {
     loadSettings();
   }, []);
 
+  useEffect(() => {
+    return () => {
+      clearNoticeTimer();
+      clearResolveAutoCloseTimer();
+    };
+  }, []);
+
   function addLog(message) {
     const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
     setLogs((items) => [`${time} ${message}`, ...items].slice(0, 12));
+  }
+
+  function normalizeTranscriptionModel(model) {
+    const value = String(model || "").trim();
+    return !value || value === "whisper-1" ? DEFAULT_SETTINGS.transcriptionModel : value;
+  }
+
+  function clearNoticeTimer() {
+    if (!noticeTimerRef.current) return;
+    window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = null;
+  }
+
+  function setNotice(message) {
+    clearNoticeTimer();
+    setNoticeState(message);
+  }
+
+  function showNotice(message, options = {}) {
+    const { autoHide = false, delay = 3200 } = options;
+    setNotice(message);
+    if (message && autoHide) {
+      noticeTimerRef.current = window.setTimeout(() => {
+        setNoticeState("");
+        noticeTimerRef.current = null;
+      }, delay);
+    }
+  }
+
+  function dismissNotice() {
+    clearNoticeTimer();
+    setNotice("");
+  }
+
+  function clearResolveAutoCloseTimer() {
+    if (!resolveAutoCloseTimerRef.current) return;
+    window.clearTimeout(resolveAutoCloseTimerRef.current);
+    resolveAutoCloseTimerRef.current = null;
+  }
+
+  function scheduleResolvePanelClose(delay = 1500) {
+    clearResolveAutoCloseTimer();
+    resolveAutoCloseTimerRef.current = window.setTimeout(() => {
+      setResolvePanelOpen(false);
+      resolveAutoCloseTimerRef.current = null;
+    }, delay);
   }
 
   function updateStep(key, state) {
@@ -116,6 +180,8 @@ function App() {
 
   function resetResults() {
     setTranscript("");
+    setAsrArtifacts(null);
+    setAsrSubtitleCount(0);
     setVisualText("");
     setTags([]);
     setOcrArtifacts(null);
@@ -161,10 +227,11 @@ function App() {
   async function loadSettings() {
     try {
       const data = await api("/api/settings");
-      setSettings({ ...DEFAULT_SETTINGS, ...data });
-      setSettingsDraft({ ...DEFAULT_SETTINGS, ...data, apiKey: "" });
+      const next = { ...DEFAULT_SETTINGS, ...data, transcriptionModel: normalizeTranscriptionModel(data.transcriptionModel) };
+      setSettings(next);
+      setSettingsDraft({ ...next, apiKey: "" });
     } catch (error) {
-      addLog(`读取 CPA 设置失败：${error.message}`);
+      addLog(`读取 AI 设置失败：${error.message}`);
     }
   }
 
@@ -256,8 +323,9 @@ function App() {
     updateStep("download", "active");
     const liveSteps = ["识别输入内容", "展开短链/读取当前抖音窗口", "尝试 yt-dlp", "尝试网页源码", "尝试专用浏览器抓取视频资源"];
     setResolveSteps([{ text: "开始解析抖音输入内容", state: "active" }]);
+    clearResolveAutoCloseTimer();
     setResolvePanelOpen(true);
-    setNotice("正在真实解析抖音链接，下面会显示每一步尝试。");
+    showNotice("正在真实解析抖音链接，下面会显示每一步尝试。");
     let stepIndex = 0;
     const timer = window.setInterval(() => {
       stepIndex = Math.min(stepIndex + 1, liveSteps.length - 1);
@@ -276,12 +344,14 @@ function App() {
       });
       setMediaReady(data.media);
       setResolveSteps([...(data.attempts || []).map((text) => ({ text, state: "done" })), { text: `解析成功：${data.strategy || "未知策略"}`, state: "done" }].slice(-10));
-      setNotice(`抖音视频解析成功，已保存到本地。策略：${data.strategy || "真实解析"}`);
+      showNotice(`抖音视频解析成功，已保存到本地。策略：${data.strategy || "真实解析"}`, { autoHide: true });
+      scheduleResolvePanelClose();
     } catch (error) {
       updateStep("source", "error");
       updateStep("download", "error");
+      clearResolveAutoCloseTimer();
       setResolveSteps((items) => [...items.map((item) => ({ ...item, state: "done" })), { text: error.message, state: "error" }].slice(-10));
-      setNotice(`${error.message} 可上传视频文件继续分析。`);
+      showNotice(`${error.message} 可上传视频文件继续分析。`);
       addLog(`抖音解析失败：${error.message}`);
     } finally {
       window.clearInterval(timer);
@@ -386,11 +456,6 @@ function App() {
       setNotice("请先上传或解析视频。");
       return;
     }
-    if (!settings.apiKeySaved || !settings.baseUrl) {
-      setSettingsOpen(true);
-      setNotice("请先在 CPA 设置中填写 Base URL 和 API Key。");
-      return;
-    }
     setBusy("asr");
     updateStep("asr", "active");
     setNotice("");
@@ -398,12 +463,15 @@ function App() {
       const data = await api("/api/transcribe-media", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mediaId: media.id, model: settings.transcriptionModel }),
+        body: JSON.stringify({ mediaId: media.id, model: normalizeTranscriptionModel(settings.transcriptionModel) }),
       });
       setTranscript(data.text || "");
+      setAsrArtifacts(data.artifacts || null);
+      setAsrSubtitleCount(Number(data.segmentCount || 0));
       updateStep("asr", data.text ? "done" : "idle");
       updateStep("merge", data.text || visualText ? "done" : "idle");
-      addLog(data.text ? "语音识别完成。" : "语音识别完成，但未识别到文字。");
+      addLog(data.text ? `语音识别完成：${data.engine || "本地 ASR"}。` : "语音识别完成，但未识别到文字，可继续运行 OCR。");
+      if (!data.text) showNotice("没有识别到语音文字。如果视频只有背景音乐或音效，请继续用 OCR 识别画面文字。");
     } catch (error) {
       updateStep("asr", "error");
       setNotice(error.message);
@@ -461,7 +529,7 @@ function App() {
     }
     if (!canUseModel) {
       setSettingsOpen(true);
-      setNotice("请先配置 CPA 模型。");
+      setNotice("请先配置 AI 改写模型。");
       return;
     }
     setBusy("rewrite");
@@ -528,6 +596,27 @@ function App() {
     }
   }
 
+  async function handleDetectAsrProfile() {
+    setBusy("asr-profile");
+    setSettingsNotice("");
+    try {
+      const data = await api("/api/asr-profile");
+      setAsrProfile(data);
+      setSettingsNotice(`本机配置检测完成，推荐本地语音模型：${data.recommended?.label || data.recommended?.model || "未识别"}`);
+    } catch (error) {
+      setSettingsNotice(`检测失败：${error.message}`);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function useRecommendedAsrModel() {
+    const model = asrProfile?.recommended?.model;
+    if (!model) return;
+    setSettingsDraft((draft) => ({ ...draft, transcriptionModel: model }));
+    setSettingsNotice(`已选择推荐模型：${asrProfile.recommended?.label || model}。点击保存后生效。`);
+  }
+
   async function handleSaveSettings() {
     setBusy("save-settings");
     setNotice("");
@@ -541,8 +630,8 @@ function App() {
       setSettings({ ...DEFAULT_SETTINGS, ...data });
       setSettingsDraft({ ...DEFAULT_SETTINGS, ...data, apiKey: "" });
       setSettingsOpen(false);
-      setNotice("CPA 设置已保存。");
-      addLog("CPA 设置已保存。");
+      setNotice("AI 设置已保存。");
+      addLog("AI 设置已保存。");
     } catch (error) {
       setSettingsNotice(`保存失败：${error.message}`);
     } finally {
@@ -591,7 +680,7 @@ function App() {
           </div>
           <div>
             <h1>抖音爆款视频复刻实验室</h1>
-            <p>本地视频解析、真实识别、CPA 改写</p>
+            <p>本地视频解析、真实识别、AI 改写</p>
           </div>
           <span className="edition">真实工具版</span>
         </section>
@@ -617,7 +706,7 @@ function App() {
           <input ref={fileInputRef} type="file" accept="video/*" hidden onChange={handleUpload} />
           <button className="settings-command" type="button" onClick={() => setSettingsOpen(true)}>
             <IconSettings size={18} />
-            CPA 设置
+            AI 设置
           </button>
         </section>
       </header>
@@ -626,7 +715,7 @@ function App() {
         <div className="notice-bar">
           <IconAlertTriangle size={17} />
           <span>{notice}</span>
-          <button type="button" onClick={() => setNotice("")}>关闭</button>
+          <button type="button" onClick={dismissNotice}>关闭</button>
         </div>
       )}
 
@@ -770,7 +859,7 @@ function App() {
           <div className="panel-title compact">
             <div>
               <h2>文案智能看板</h2>
-              <p>{canUseModel ? `模型：${settings.model}` : "未配置 CPA 模型"}</p>
+              <p>{canUseModel ? `模型：${settings.model}` : "未配置 AI 模型"}</p>
             </div>
             <button className="tiny-action" type="button" onClick={() => copyText(composeAllText(sourceText, variants), "全部内容")}>
               <IconCopy size={16} />
@@ -799,9 +888,15 @@ function App() {
                 {tags.map((chip) => <span key={chip}>{chip}</span>)}
               </div>
             )}
+            {asrSrtUrl && (
+              <div className="artifact-row">
+                <a href={asrSrtUrl} target="_blank" rel="noreferrer">下载语音 SRT 字幕</a>
+                <span>{asrSubtitleCount ? `已生成 ${asrSubtitleCount} 条语音时间线` : "已生成语音时间线字幕文件"}</span>
+              </div>
+            )}
             {ocrSrtUrl && (
               <div className="artifact-row">
-                <a href={ocrSrtUrl} target="_blank" rel="noreferrer">下载 SRT 字幕</a>
+                <a href={ocrSrtUrl} target="_blank" rel="noreferrer">下载画面 SRT 字幕</a>
                 <span>{ocrSubtitleCount ? `已生成 ${ocrSubtitleCount} 条时间线字幕` : "已生成时间线字幕文件"}</span>
               </div>
             )}
@@ -913,12 +1008,12 @@ function App() {
       )}
 
       {settingsOpen && (
-        <section className="modal-layer" role="dialog" aria-modal="true" aria-label="CPA 设置">
+        <section className="modal-layer" role="dialog" aria-modal="true" aria-label="AI 设置">
           <div className="settings-modal panel">
             <div className="modal-head">
               <div>
-                <h2>CPA 接入设置</h2>
-                <p>填写兼容 OpenAI /v1 的 Base URL 和 API Key，获取模型后保存使用。</p>
+                <h2>AI 改写与本地识别设置</h2>
+                <p>AI 改写需要填写兼容 OpenAI /v1 的 Base URL 和 API Key；本地语音识别无需 API Key。</p>
               </div>
               <button type="button" onClick={() => setSettingsOpen(false)} aria-label="关闭设置">
                 <IconX size={20} />
@@ -935,24 +1030,7 @@ function App() {
               <input value={settingsDraft.baseUrl} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, baseUrl: event.target.value }))} placeholder="例如：https://api.openai.com/v1" />
             </label>
             <label>
-              <span>抖音解析 API（可选，优先使用，不打开抖音网页）</span>
-              <input
-                value={settingsDraft.parserApiTemplate || ""}
-                onChange={(event) => setSettingsDraft((draft) => ({ ...draft, parserApiTemplate: event.target.value }))}
-                placeholder="例如：https://你的解析服务/api/download?url={url}"
-              />
-            </label>
-            <label>
-              <span>解析 API Key {settings.parserApiKeySaved ? "（已保存，可留空不改）" : "（可选）"}</span>
-              <input
-                type="password"
-                value={settingsDraft.parserApiKey || ""}
-                onChange={(event) => setSettingsDraft((draft) => ({ ...draft, parserApiKey: event.target.value }))}
-                placeholder="付费解析 API 或 Coze Webhook 需要鉴权时填写"
-              />
-            </label>
-            <label>
-              <span>API Key {settings.apiKeySaved ? "（已保存，可留空不改）" : ""}</span>
+              <span>AI 改写 API Key {settings.apiKeySaved ? "（已保存，可留空不改）" : ""}</span>
               <input type="password" value={settingsDraft.apiKey || ""} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, apiKey: event.target.value }))} placeholder="只保存在本地后端配置文件" />
             </label>
             <div className="modal-actions">
@@ -973,9 +1051,49 @@ function App() {
               </select>
             </label>
             <label>
-              <span>语音识别模型</span>
-              <input value={settingsDraft.transcriptionModel} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, transcriptionModel: event.target.value }))} />
+              <span>本地语音识别模型</span>
+              <select value={settingsDraft.transcriptionModel} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, transcriptionModel: event.target.value }))}>
+                {ASR_MODEL_OPTIONS.map((item) => (
+                  <option key={item.value} value={item.value}>{item.label} - {item.hint}</option>
+                ))}
+              </select>
             </label>
+            <div className="asr-profile-card">
+              <div className="asr-profile-head">
+                <div>
+                  <strong>本机模型推荐</strong>
+                  <span>按 CPU、内存、显卡和本地依赖给出建议</span>
+                </div>
+                <button type="button" onClick={handleDetectAsrProfile} disabled={busy === "asr-profile"}>
+                  <IconRefresh size={15} />
+                  {busy === "asr-profile" ? "检测中" : "检测配置"}
+                </button>
+              </div>
+              {asrProfile ? (
+                <>
+                  <div className="asr-system-grid">
+                    <span>CPU：{asrProfile.system?.cpuCores || "-"} 核</span>
+                    <span>内存：{asrProfile.system?.totalMemoryGb || "-"} GB</span>
+                    <span>显卡：{asrProfile.gpus?.[0]?.name || "未检测到独立显卡"}</span>
+                    <span>依赖：{asrProfile.recommended?.dependencyOk ? "已就绪" : "需安装 faster-whisper"}</span>
+                  </div>
+                  <div className="asr-recommend-line">
+                    <p><b>推荐：</b>{asrProfile.recommended?.label || asrProfile.recommended?.model}</p>
+                    <span>{asrProfile.recommended?.reason}</span>
+                    <button type="button" onClick={useRecommendedAsrModel}>使用推荐模型</button>
+                  </div>
+                  <div className="asr-option-list">
+                    {(asrProfile.recommended?.options || []).map((item) => (
+                      <span className={item.selected ? "selected" : ""} key={item.model}>
+                        {item.shortName} · {item.fit}
+                      </span>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <p className="asr-profile-empty">不同用户电脑配置不同，点击“检测配置”后会自动推荐 tiny、base、small、medium 或 large-v3。</p>
+              )}
+            </div>
             <label>
               <span>抖音 Cookie（可选，{settings.douyinCookieSaved ? "已保存，可留空不改" : "提高链接解析成功率"}）</span>
               <div className="cookie-actions">

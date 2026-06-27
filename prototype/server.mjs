@@ -4,6 +4,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { promises as fsp } from "node:fs";
 import { execFile } from "node:child_process";
+import os from "node:os";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -13,6 +14,7 @@ const rootDir = __dirname;
 const dataDir = path.join(rootDir, "local-data");
 const uploadDir = path.join(dataDir, "uploads");
 const ocrRunDir = path.join(dataDir, "ocr-runs");
+const asrRunDir = path.join(dataDir, "asr-runs");
 const douyinBrowserProfileDir = path.join(dataDir, "douyin-browser-profile");
 const settingsPath = path.join(dataDir, "settings.json");
 const manifestPath = path.join(dataDir, "media-manifest.json");
@@ -20,14 +22,23 @@ const distDir = path.join(rootDir, "dist");
 const scriptsDir = path.join(rootDir, "scripts");
 const frameExtractorScript = path.join(scriptsDir, "extract_frames.py");
 const videoOcrScript = path.join(scriptsDir, "video_ocr.py");
+const transcriptionScript = path.join(scriptsDir, "transcribe_media.py");
 const chromeUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const douyinHeaders = {
   "User-Agent": chromeUserAgent,
   "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
   Referer: "https://www.douyin.com/",
 };
+const localAsrModels = [
+  { model: "Systran/faster-whisper-tiny", shortName: "tiny", minRamGb: 4, minGpuGb: 0, tier: "极快", note: "低配电脑可用，准确率最低" },
+  { model: "Systran/faster-whisper-base", shortName: "base", minRamGb: 6, minGpuGb: 0, tier: "快速", note: "轻量识别，适合普通办公本" },
+  { model: "Systran/faster-whisper-small", shortName: "small", minRamGb: 8, minGpuGb: 0, tier: "均衡", note: "默认推荐，速度和准确率比较稳" },
+  { model: "Systran/faster-whisper-medium", shortName: "medium", minRamGb: 16, minGpuGb: 6, tier: "高准确", note: "中文口播更好，CPU 会明显更慢" },
+  { model: "large-v3", shortName: "large-v3", minRamGb: 32, minGpuGb: 10, tier: "最高准确", note: "适合高配显卡或愿意等待的高配电脑" },
+];
 await fsp.mkdir(uploadDir, { recursive: true });
 await fsp.mkdir(ocrRunDir, { recursive: true });
+await fsp.mkdir(asrRunDir, { recursive: true });
 await fsp.mkdir(douyinBrowserProfileDir, { recursive: true });
 
 const app = express();
@@ -37,6 +48,7 @@ let douyinCookieContext = null;
 app.use(express.json({ limit: "40mb" }));
 app.use("/media", express.static(uploadDir));
 app.use("/ocr-output", express.static(ocrRunDir));
+app.use("/asr-output", express.static(asrRunDir));
 
 const storage = multer.diskStorage({
   destination: uploadDir,
@@ -67,6 +79,10 @@ function publicOcrUrl(runName, fileName) {
   return `/ocr-output/${encodeURIComponent(runName)}/${encodeURIComponent(fileName)}`;
 }
 
+function publicAsrUrl(runName, fileName) {
+  return `/asr-output/${encodeURIComponent(runName)}/${encodeURIComponent(fileName)}`;
+}
+
 function cleanUploadName(name) {
   const raw = String(name || "video.mp4");
   if (!/[ÃÂæéèå]/.test(raw)) return raw;
@@ -90,16 +106,19 @@ async function writeJson(filePath, data) {
   await fsp.writeFile(filePath, JSON.stringify(data, null, 2), "utf8");
 }
 
+function normalizeTranscriptionModel(model) {
+  const value = String(model || "").trim();
+  return !value || value === "whisper-1" ? "Systran/faster-whisper-small" : value;
+}
+
 async function getSettings() {
   return readJson(settingsPath, {
     baseUrl: "",
     apiKey: "",
     douyinCookie: "",
     douyinCookieJar: [],
-    parserApiTemplate: "",
-    parserApiKey: "",
     model: "",
-    transcriptionModel: "whisper-1",
+    transcriptionModel: "Systran/faster-whisper-small",
     models: [],
   });
 }
@@ -109,13 +128,11 @@ function redactSettings(settings) {
   return {
     baseUrl: settings.baseUrl || "",
     model: settings.model || "",
-    transcriptionModel: settings.transcriptionModel || "whisper-1",
+    transcriptionModel: normalizeTranscriptionModel(settings.transcriptionModel),
     models: Array.isArray(settings.models) ? settings.models : [],
     apiKeySaved: Boolean(settings.apiKey),
     douyinCookieSaved: Boolean(settings.douyinCookie),
     douyinCookieInfo: cookieInfo,
-    parserApiTemplate: settings.parserApiTemplate || "",
-    parserApiKeySaved: Boolean(settings.parserApiKey),
   };
 }
 
@@ -593,65 +610,6 @@ function collectUrlsFromJson(value, found = []) {
   return found;
 }
 
-async function tryExternalParserApi(rawInput, settings, id) {
-  const template = String(settings.parserApiTemplate || "").trim();
-  if (!template) throw new Error("未配置外部解析 API。");
-  const url = extractFirstHttpUrl(rawInput) || String(rawInput || "").trim();
-  if (!url) throw new Error("外部解析 API 需要抖音链接或口令输入。");
-  const requestUrl = template.includes("{url}")
-    ? template.replaceAll("{url}", encodeURIComponent(url))
-    : `${template}${template.includes("?") ? "&" : "?"}url=${encodeURIComponent(url)}`;
-  const headers = {
-    "User-Agent": chromeUserAgent,
-    Accept: "application/json, video/mp4, */*",
-  };
-  if (settings.parserApiKey) headers.Authorization = `Bearer ${settings.parserApiKey}`;
-  const response = await fetch(requestUrl, {
-    headers,
-    redirect: "follow",
-    signal: AbortSignal.timeout(120000),
-  });
-  const contentType = response.headers.get("content-type") || "";
-  if (!response.ok) throw new Error(`外部解析 API 返回失败：${response.status}`);
-  if (/video|octet-stream/i.test(contentType)) {
-    const filePath = path.join(uploadDir, `douyin-${id}-api.mp4`);
-    await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(filePath));
-    const stats = await fsp.stat(filePath);
-    if (stats.size < 1024 * 16) throw new Error("外部解析 API 返回的视频文件过小。");
-    return filePath;
-  }
-  const text = await response.text();
-  let parsed = null;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    const urls = findVideoUrlsInHtml(text);
-    for (const item of urls.slice(0, 8)) {
-      try {
-        return await downloadDirectVideo(item, id);
-      } catch {
-        // Try next URL.
-      }
-    }
-    throw new Error("外部解析 API 未返回标准 JSON 或视频地址。");
-  }
-  const urls = collectUrlsFromJson(parsed)
-    .map((item) => normalizeEscapedUrl(item))
-    .filter((item, index, array) => array.indexOf(item) === index);
-  const preferred = urls.sort((left, right) => {
-    const score = (item) => (/watermark|playwm/i.test(item) ? 0 : 2) + (/\.mp4|video\/tos|douyinvod/i.test(item) ? 1 : 0);
-    return score(right) - score(left);
-  });
-  for (const item of preferred.slice(0, 12)) {
-    try {
-      return await downloadDirectVideo(item, id);
-    } catch {
-      // Try next URL.
-    }
-  }
-  throw new Error("外部解析 API 返回了数据，但没有可下载的视频地址。");
-}
-
 function isDouyinStaticVideoAsset(url) {
   const text = String(url || "");
   return /douyin-pc-web\/.*\.mp4|\/uuu_\d+\.mp4|play_effect|playing_effect|download-guide/i.test(text);
@@ -979,7 +937,7 @@ function summarizeDouyinError(errors) {
     return "抖音要求新鲜 Cookie。请打开 CPA 设置，点击“打开抖音登录窗口”，登录后点击“自动读取 Cookie”，再重新解析。";
   }
   if (/Could not copy Chrome cookie database|cookie database/i.test(text)) {
-    return "系统浏览器 Cookie 数据库不可读。工具已取消读取系统浏览器，建议使用“打开抖音登录窗口 + 自动读取 Cookie”或配置外部解析 API。";
+    return "系统浏览器 Cookie 数据库不可读。工具已取消读取系统浏览器，建议使用“打开抖音登录窗口 + 自动读取 Cookie”。";
   }
   if (/SSL|EOF|TLS|Connection was reset|Recv failure/i.test(text)) {
     return "网络或抖音风控中断了连接。已尝试浏览器指纹方式，仍失败；可换一个单条视频分享链接、关闭代理后重试，或直接上传视频。";
@@ -992,15 +950,6 @@ async function resolveDouyinVideo(rawInput, cookieSource = {}, settings = {}) {
   let candidates = [];
   const id = randomId();
   const attempts = [];
-  if (settings.parserApiTemplate) {
-    try {
-      attempts.push("尝试外部解析 API（不打开抖音网页）");
-      const downloadedPath = await tryExternalParserApi(rawInput, settings, id);
-      return { downloadedPath, strategy: "外部解析 API", sourceUrl: extractFirstHttpUrl(rawInput) || "API 输入内容", attempts };
-    } catch (error) {
-      attempts.push(`外部解析 API 未成功：${error.message}`);
-    }
-  }
   try {
     candidates = buildDouyinCandidates(rawInput, browserCandidates);
   } catch (error) {
@@ -1352,8 +1301,169 @@ async function fileIfExists(filePath) {
   }
 }
 
+function roundGb(bytes) {
+  return Math.round((Number(bytes || 0) / 1024 / 1024 / 1024) * 10) / 10;
+}
+
+function parseJsonMaybe(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
+async function inspectPythonAsrDependencies() {
+  const script = [
+    "import importlib, json",
+    "mods=['faster_whisper','ctranslate2','av']",
+    "out={}",
+    "for name in mods:",
+    "    try:",
+    "        mod=importlib.import_module(name)",
+    "        out[name]={'ok': True, 'version': getattr(mod, '__version__', '')}",
+    "    except Exception as exc:",
+    "        out[name]={'ok': False, 'error': str(exc)}",
+    "print(json.dumps(out, ensure_ascii=False))",
+  ].join("\n");
+  try {
+    const result = await execFilePromise("python", ["-c", script], {
+      cwd: rootDir,
+      timeout: 30000,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    });
+    return parseLastJsonObject(result.stdout);
+  } catch (error) {
+    return { python: { ok: false, error: summarizeAsrError(error) } };
+  }
+}
+
+async function inspectNvidiaGpu() {
+  try {
+    const result = await execFilePromise("nvidia-smi", [
+      "--query-gpu=name,memory.total",
+      "--format=csv,noheader,nounits",
+    ], {
+      timeout: 12000,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    });
+    const line = String(result.stdout || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean)[0];
+    if (!line) return null;
+    const [name, memoryMb] = line.split(",").map((item) => item.trim());
+    return { name, memoryGb: Math.round((Number(memoryMb || 0) / 1024) * 10) / 10, vendor: "NVIDIA", source: "nvidia-smi" };
+  } catch {
+    return null;
+  }
+}
+
+async function inspectWindowsGpu() {
+  if (process.platform !== "win32") return [];
+  const command = "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Json -Compress";
+  try {
+    const result = await execFilePromise("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], {
+      timeout: 15000,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    });
+    const parsed = parseJsonMaybe(String(result.stdout || "").trim(), []);
+    return (Array.isArray(parsed) ? parsed : [parsed])
+      .filter((item) => item?.Name)
+      .map((item) => ({
+        name: String(item.Name || ""),
+        memoryGb: roundGb(Number(item.AdapterRAM || 0)),
+        vendor: /nvidia|geforce|rtx|gtx|quadro/i.test(item.Name || "") ? "NVIDIA" : /amd|radeon/i.test(item.Name || "") ? "AMD" : /intel/i.test(item.Name || "") ? "Intel" : "Unknown",
+        source: "Win32_VideoController",
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function recommendAsrModel(system, gpus, dependencies) {
+  const totalRamGb = Number(system.totalMemoryGb || 0);
+  const cpuCores = Number(system.cpuCores || 0);
+  const bestGpu = [...(gpus || [])].sort((a, b) => Number(b.memoryGb || 0) - Number(a.memoryGb || 0))[0] || null;
+  const hasNvidia = Boolean(bestGpu && /nvidia/i.test(bestGpu.vendor || bestGpu.name || ""));
+  const gpuGb = Number(bestGpu?.memoryGb || 0);
+  let model = "Systran/faster-whisper-small";
+  let reason = "默认均衡方案，适合大多数中文短视频口播。";
+
+  if (hasNvidia && gpuGb >= 10) {
+    model = "large-v3";
+    reason = "检测到 10GB 以上 NVIDIA 显存，可以优先使用 large-v3 追求更高准确率。";
+  } else if ((hasNvidia && gpuGb >= 6) || (totalRamGb >= 32 && cpuCores >= 12)) {
+    model = "Systran/faster-whisper-medium";
+    reason = hasNvidia ? "检测到 6GB 以上 NVIDIA 显存，推荐 medium 提升准确率。" : "CPU 核心和内存较充足，可选择 medium；速度会比 small 慢。";
+  } else if (totalRamGb >= 16 && cpuCores >= 8) {
+    model = "Systran/faster-whisper-small";
+    reason = "内存和 CPU 足够，small 是速度与准确率更稳的默认选择。";
+  } else if (totalRamGb >= 8) {
+    model = "Systran/faster-whisper-base";
+    reason = "内存一般，base 更稳，识别速度更快。";
+  } else {
+    model = "Systran/faster-whisper-tiny";
+    reason = "内存偏低，tiny 更容易跑起来，但准确率较低。";
+  }
+
+  const dependencyOk = Boolean(dependencies?.faster_whisper?.ok && dependencies?.ctranslate2?.ok && dependencies?.av?.ok);
+  const options = localAsrModels.map((item) => {
+    const hasRam = totalRamGb >= item.minRamGb;
+    const hasGpu = !item.minGpuGb || (hasNvidia && gpuGb >= item.minGpuGb);
+    const cpuFallback = item.shortName !== "large-v3" && hasRam;
+    return {
+      ...item,
+      fit: hasGpu || cpuFallback ? "可用" : hasRam ? "可试，可能很慢" : "不建议",
+      selected: item.model === model,
+    };
+  });
+  return {
+    model,
+    label: localAsrModels.find((item) => item.model === model)?.shortName || model,
+    reason: dependencyOk ? reason : `${reason} 但当前 Python 语音识别依赖不完整，需要先安装 faster-whisper。`,
+    dependencyOk,
+    options,
+  };
+}
+
+function sortDisplayGpus(gpus) {
+  return [...(gpus || [])].sort((a, b) => {
+    const av = /virtual|remote|driver/i.test(a.name || "") ? 1 : 0;
+    const bv = /virtual|remote|driver/i.test(b.name || "") ? 1 : 0;
+    if (av !== bv) return av - bv;
+    return Number(b.memoryGb || 0) - Number(a.memoryGb || 0);
+  });
+}
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/api/asr-profile", async (_req, res) => {
+  try {
+    const cpus = os.cpus() || [];
+    const nvidiaGpu = await inspectNvidiaGpu();
+    const windowsGpus = await inspectWindowsGpu();
+    const gpus = sortDisplayGpus(nvidiaGpu ? [nvidiaGpu, ...windowsGpus.filter((item) => item.name !== nvidiaGpu.name)] : windowsGpus);
+    const dependencies = await inspectPythonAsrDependencies();
+    const system = {
+      platform: process.platform,
+      arch: process.arch,
+      cpuModel: cpus[0]?.model || "Unknown CPU",
+      cpuCores: cpus.length || os.availableParallelism?.() || 0,
+      totalMemoryGb: roundGb(os.totalmem()),
+      freeMemoryGb: roundGb(os.freemem()),
+    };
+    res.json({
+      system,
+      gpus,
+      dependencies,
+      recommended: recommendAsrModel(system, gpus, dependencies),
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
 app.get("/api/settings", async (_req, res) => {
@@ -1366,9 +1476,8 @@ app.post("/api/settings", async (req, res) => {
     const next = {
       ...current,
       baseUrl: String(req.body.baseUrl || "").trim(),
-      parserApiTemplate: String(req.body.parserApiTemplate || current.parserApiTemplate || "").trim(),
       model: String(req.body.model || "").trim(),
-      transcriptionModel: String(req.body.transcriptionModel || current.transcriptionModel || "whisper-1").trim(),
+      transcriptionModel: normalizeTranscriptionModel(req.body.transcriptionModel || current.transcriptionModel),
       models: Array.isArray(req.body.models) ? req.body.models : current.models || [],
     };
     if (typeof req.body.apiKey === "string" && req.body.apiKey.trim()) {
@@ -1377,9 +1486,8 @@ app.post("/api/settings", async (req, res) => {
     if (typeof req.body.douyinCookie === "string" && req.body.douyinCookie.trim()) {
       next.douyinCookie = req.body.douyinCookie.trim();
     }
-    if (typeof req.body.parserApiKey === "string" && req.body.parserApiKey.trim()) {
-      next.parserApiKey = req.body.parserApiKey.trim();
-    }
+    delete next.parserApiTemplate;
+    delete next.parserApiKey;
     await writeJson(settingsPath, next);
     res.json(redactSettings(next));
   } catch (error) {
@@ -1672,42 +1780,139 @@ app.post("/api/analyze-frames", async (req, res) => {
   }
 });
 
+function summarizeAsrError(error) {
+  return String(error?.stderr || error?.stdout || error?.message || error || "未知错误")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 600);
+}
+
+function hasRemoteTranscriptionConfig(settings) {
+  return Boolean(normalizeBaseUrl(settings.baseUrl) && settings.apiKey);
+}
+
+function normalizeRemoteTranscriptionModel(model) {
+  const value = String(model || "").trim();
+  if (!value || value === "local" || value === "whisper-1" || /faster-whisper/i.test(value)) return "whisper-1";
+  if (["tiny", "base", "small", "medium"].includes(value.toLowerCase())) return "whisper-1";
+  return value;
+}
+
+async function transcribeWithLocal(record, requestedModel) {
+  if (!(await fileIfExists(transcriptionScript))) {
+    throw new Error("工具内置本地语音识别脚本缺失。");
+  }
+  const model = normalizeTranscriptionModel(requestedModel);
+  const runName = `${Date.now()}-${record.id}-asr`;
+  const outDir = path.join(asrRunDir, runName);
+  const filePath = path.join(uploadDir, record.fileName);
+  const result = await execFilePromise("python", [
+    transcriptionScript,
+    filePath,
+    "--output-dir",
+    outDir,
+    "--model",
+    model,
+    "--language",
+    "zh",
+  ], {
+    cwd: rootDir,
+    timeout: 1000 * 60 * 60,
+    windowsHide: true,
+    maxBuffer: 1024 * 1024 * 20,
+  });
+  const output = parseLastJsonObject(result.stdout);
+  const resultPath = path.join(outDir, "result.json");
+  const fileOutput = await readJson(resultPath, output);
+  const finalOutput = Object.keys(fileOutput || {}).length ? fileOutput : output;
+  const srtFile = finalOutput.srtFile || "subtitles.srt";
+  const textFile = finalOutput.textFile || "transcript.txt";
+  return {
+    text: String(finalOutput.text || "").trim(),
+    segments: Array.isArray(finalOutput.segments) ? finalOutput.segments : [],
+    segmentCount: Number(finalOutput.segmentCount || 0),
+    model: finalOutput.model || model,
+    engine: "本地 faster-whisper",
+    language: finalOutput.language || "",
+    languageProbability: finalOutput.languageProbability || null,
+    duration: finalOutput.duration || record.duration || 0,
+    artifacts: {
+      srt: publicAsrUrl(runName, srtFile),
+      text: publicAsrUrl(runName, textFile),
+    },
+    fileStatus: {
+      srt: await fileIfExists(path.join(outDir, srtFile)),
+      text: await fileIfExists(path.join(outDir, textFile)),
+    },
+  };
+}
+
+async function transcribeWithRemote(record, requestedModel, settings) {
+  const baseUrl = requireApiConfig(settings);
+  const filePath = path.join(uploadDir, record.fileName);
+  const buffer = await fsp.readFile(filePath);
+  const form = new FormData();
+  form.append(
+    "file",
+    new File([buffer], record.originalName || record.fileName, { type: record.mimeType || "video/mp4" }),
+  );
+  form.append("model", normalizeRemoteTranscriptionModel(requestedModel));
+  form.append("response_format", "json");
+  let response;
+  try {
+    response = await fetch(apiPath(baseUrl, "/audio/transcriptions"), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${settings.apiKey}` },
+      body: form,
+    });
+  } catch {
+    throw new Error("无法连接到 CPA Base URL，请检查地址、网络或代理。");
+  }
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { text };
+  }
+  if (!response.ok) {
+    throw new Error(data?.error?.message || data?.message || text || "语音识别请求失败。");
+  }
+  return {
+    text: String(data.text || "").trim(),
+    segments: [],
+    segmentCount: 0,
+    model: normalizeRemoteTranscriptionModel(requestedModel),
+    engine: "CPA 音频转写",
+    raw: data,
+  };
+}
+
 app.post("/api/transcribe-media", async (req, res) => {
   try {
     const settings = await getSettings();
-    const baseUrl = requireApiConfig(settings);
     const record = await findMediaRecord(String(req.body.mediaId || ""));
     if (!record) throw new Error("找不到已上传或已解析的视频。");
-    const filePath = path.join(uploadDir, record.fileName);
-    const buffer = await fsp.readFile(filePath);
-    const form = new FormData();
-    form.append(
-      "file",
-      new File([buffer], record.originalName || record.fileName, { type: record.mimeType || "video/mp4" }),
-    );
-    form.append("model", String(req.body.model || settings.transcriptionModel || "whisper-1"));
-    form.append("response_format", "json");
-    let response;
+    const requestedModel = normalizeTranscriptionModel(req.body.model || settings.transcriptionModel);
+
+    let localError = null;
     try {
-      response = await fetch(apiPath(baseUrl, "/audio/transcriptions"), {
-        method: "POST",
-        headers: { Authorization: `Bearer ${settings.apiKey}` },
-        body: form,
-      });
-    } catch {
-      throw new Error("无法连接到 CPA Base URL，请检查地址、网络或代理。");
+      res.json(await transcribeWithLocal(record, requestedModel));
+      return;
+    } catch (error) {
+      localError = error;
     }
-    const text = await response.text();
-    let data = null;
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      data = { text };
+
+    if (hasRemoteTranscriptionConfig(settings)) {
+      try {
+        res.json(await transcribeWithRemote(record, requestedModel, settings));
+        return;
+      } catch (remoteError) {
+        throw new Error(`本地语音识别失败：${summarizeAsrError(localError)}；CPA 兜底也失败：${summarizeAsrError(remoteError)}`);
+      }
     }
-    if (!response.ok) {
-      throw new Error(data?.error?.message || data?.message || text || "语音识别请求失败。");
-    }
-    res.json({ text: String(data.text || "").trim(), raw: data });
+
+    throw new Error(`本地语音识别失败：${summarizeAsrError(localError)}。请确认已安装 faster-whisper，或首次运行时允许下载本地模型。`);
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
