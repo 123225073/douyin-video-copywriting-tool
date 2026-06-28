@@ -1,4 +1,4 @@
-# Douyin Video Copywriting Tool
+# 风沙爆款复刻台
 
 一个本地运行的抖音视频解析、文案提取、SRT 字幕生成和 AI 改写工具。适合短视频拆解、爆款文案复刻、素材整理，以及 CPA/OpenAI 兼容接口或 DeepSeek 官方接口接入。
 
@@ -207,5 +207,5 @@ prototype/local-data/
 | --- | --- |
 | Repository | `123225073/douyin-video-copywriting-tool` |
 | Visibility | Public |
-| Description | 本地运行的抖音视频解析、字幕/OCR 文案提取、SRT 生成与 CPA/DeepSeek AI 改写工具。 |
+| Description | 风沙爆款复刻台：本地运行的抖音视频解析、字幕/OCR 文案提取、SRT 生成与 CPA/DeepSeek AI 改写工具。 |
 | Topics | `douyin`, `video-downloader`, `ocr`, `subtitle-extraction`, `srt`, `ai-copywriting`, `react`, `express`, `opencv`, `rapidocr`, `local-tool` |

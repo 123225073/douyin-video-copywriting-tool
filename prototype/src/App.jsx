@@ -92,6 +92,33 @@ const OUTPUT_LANGUAGE_OPTIONS = [
   "印尼文",
 ];
 
+const GUIDE_STEPS = [
+  {
+    icon: IconLink,
+    title: "1. 放入视频",
+    imageLabel: "抖音链接 / 本地视频",
+    text: "把抖音分享内容粘贴到顶部输入框，点“解析链接”；如果解析失败，直接点“上传视频”。",
+  },
+  {
+    icon: IconPlayerPlay,
+    title: "2. 确认能播放",
+    imageLabel: "真实视频预览",
+    text: "左侧出现视频并能播放后，再继续识别。这里不会显示假结果。",
+  },
+  {
+    icon: IconMicrophone,
+    title: "3. 选择识别方式",
+    imageLabel: "语音 / OCR",
+    text: "有口播就先点“语音识别”；没有声音但画面有字幕，就点“OCR识别”。两种都可以运行。",
+  },
+  {
+    icon: IconSparkles,
+    title: "4. AI 整理改写",
+    imageLabel: "原文整理 / 改写",
+    text: "识别出文案后点“AI改写”，可以得到原文整理版、爆款口播版和强转化版。",
+  },
+];
+
 const VIDEO_EXTENSION_PATTERN = /\.(mp4|m4v|mov|webm|mkv|avi)$/i;
 const AI_PROVIDERS = {
   cpa: { label: "CPA 反代", keyUrl: "" },
@@ -182,6 +209,7 @@ function App() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [settingsDraft, setSettingsDraft] = useState(DEFAULT_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const [settingsNotice, setSettingsNotice] = useState("");
   const [asrProfile, setAsrProfile] = useState(null);
   const [resolveSteps, setResolveSteps] = useState(safeArray(cachedSession.resolveSteps));
@@ -961,8 +989,8 @@ function App() {
             <IconBrandTiktok size={23} stroke={2.4} />
           </div>
           <div>
-            <h1>抖音爆款视频复刻实验室</h1>
-            <p>本地视频解析、真实识别、AI 改写</p>
+            <h1>风沙爆款复刻台</h1>
+            <p>短视频解析、文案提取、AI 改写</p>
           </div>
           <span className="edition">真实工具版</span>
         </section>
@@ -989,6 +1017,10 @@ function App() {
           <button className="reset-command" type="button" onClick={handleResetWorkspace}>
             <IconRefresh size={17} />
             重置
+          </button>
+          <button className="help-command" type="button" onClick={() => setHelpOpen(true)}>
+            <IconFileText size={17} />
+            使用说明
           </button>
           <button className="settings-command" type="button" onClick={() => setSettingsOpen(true)}>
             <IconSettings size={18} />
@@ -1427,6 +1459,90 @@ function App() {
                 </div>
               </section>
             </div>
+          </div>
+        </section>
+      )}
+
+      {helpOpen && (
+        <section className="modal-layer" role="dialog" aria-modal="true" aria-label="使用说明">
+          <div className="guide-modal panel">
+            <div className="modal-head">
+              <div>
+                <h2>风沙爆款复刻台使用说明</h2>
+                <p>按下面 4 步走：先拿到真实视频，再识别文案，最后整理和改写。</p>
+              </div>
+              <button type="button" onClick={() => setHelpOpen(false)} aria-label="关闭使用说明">
+                <IconX size={20} />
+              </button>
+            </div>
+
+            <section className="guide-hero">
+              <div>
+                <span>推荐流程</span>
+                <strong>链接 / 上传 → 播放确认 → 语音或 OCR → AI 改写</strong>
+              </div>
+              <button type="button" onClick={() => setHelpOpen(false)}>
+                开始使用
+              </button>
+            </section>
+
+            <div className="guide-step-grid">
+              {GUIDE_STEPS.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <article className="guide-step-card" key={item.title}>
+                    <div className="guide-visual">
+                      <Icon size={28} />
+                      <span>{item.imageLabel}</span>
+                    </div>
+                    <h3>{item.title}</h3>
+                    <p>{item.text}</p>
+                  </article>
+                );
+              })}
+            </div>
+
+            <section className="guide-section">
+              <h3>怎么选识别方式</h3>
+              <div className="guide-choice-grid">
+                <div>
+                  <IconMicrophone size={22} />
+                  <strong>视频有人说话</strong>
+                  <p>优先点“语音识别”。速度通常更快，适合口播、课程、采访、解说类视频。</p>
+                </div>
+                <div>
+                  <IconScan size={22} />
+                  <strong>视频只有字幕或画面文字</strong>
+                  <p>点“OCR识别”。它会从画面里读文字，并尽量忽略 Logo、水印区域。</p>
+                </div>
+                <div>
+                  <IconBrain size={22} />
+                  <strong>又有声音又有字幕</strong>
+                  <p>两种都可以跑。右侧会分开显示语音和画面结果，方便你互相校对。</p>
+                </div>
+              </div>
+            </section>
+
+            <section className="guide-section">
+              <h3>AI 改写前要做什么</h3>
+              <div className="guide-flow">
+                <span><IconSettings size={18} /> 打开 AI 设置</span>
+                <span><IconKey size={18} /> 填 API Key</span>
+                <span><IconChevronDown size={18} /> 获取并选择模型</span>
+                <span><IconCheck size={18} /> 保存后再改写</span>
+              </div>
+              <p className="guide-note">DeepSeek 区域带有“申请 API Key”入口；CPA 反代需要填写你自己的 Base URL 和 API Key。</p>
+            </section>
+
+            <section className="guide-section">
+              <h3>常用按钮说明</h3>
+              <div className="guide-button-list">
+                <span><IconDownload size={18} /> 下载视频：保存当前真实视频文件。</span>
+                <span><IconFileText size={18} /> 对比原文：查看 AI 改写和原文差异。</span>
+                <span><IconRefresh size={18} /> 重置：清空当前任务缓存，重新开始。</span>
+                <span><IconShieldCheck size={18} /> 刷新页面：不会清空结果，除非你点了重置。</span>
+              </div>
+            </section>
           </div>
         </section>
       )}
