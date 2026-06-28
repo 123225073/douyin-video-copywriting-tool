@@ -39,10 +39,28 @@ const VIEW_TABS = [
   { key: "logs", label: "运行日志" },
 ];
 
+const SESSION_CACHE_KEY = "douyin-remake-lab-session-v2";
+const DEFAULT_LOGS = ["等待输入抖音链接，或上传本地视频开始。"];
+const DEFAULT_STEP_STATE = {
+  source: "idle",
+  download: "idle",
+  asr: "idle",
+  ocr: "idle",
+  merge: "idle",
+  rewrite: "idle",
+};
+
 const DEFAULT_SETTINGS = {
+  activeAiProvider: "cpa",
   baseUrl: "",
   apiKey: "",
   apiKeySaved: false,
+  deepseekBaseUrl: "https://api.deepseek.com",
+  deepseekApiKey: "",
+  deepseekApiKeySaved: false,
+  deepseekModel: "",
+  deepseekModels: [],
+  asrSimplifiedOnly: false,
   douyinCookie: "",
   douyinCookieSaved: false,
   model: "",
@@ -58,68 +76,218 @@ const ASR_MODEL_OPTIONS = [
   { value: "large-v3", label: "faster-whisper-large-v3", hint: "高配电脑/显卡优先" },
 ];
 
+const OUTPUT_LANGUAGE_OPTIONS = [
+  "简体中文",
+  "繁体中文",
+  "英文",
+  "法文",
+  "日文",
+  "韩文",
+  "德文",
+  "西班牙文",
+  "葡萄牙文",
+  "意大利文",
+  "越南文",
+  "泰文",
+  "印尼文",
+];
+
+const VIDEO_EXTENSION_PATTERN = /\.(mp4|m4v|mov|webm|mkv|avi)$/i;
+const AI_PROVIDERS = {
+  cpa: { label: "CPA 反代", keyUrl: "" },
+  deepseek: { label: "DeepSeek 官方", keyUrl: "https://platform.deepseek.com/api_keys" },
+};
+
+function readSessionCache() {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(SESSION_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeSessionCache(session) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(SESSION_CACHE_KEY, JSON.stringify(session));
+  } catch {
+    try {
+      window.localStorage.setItem(SESSION_CACHE_KEY, JSON.stringify({
+        ...session,
+        frames: [],
+        logs: Array.isArray(session.logs) ? session.logs.slice(0, 6) : DEFAULT_LOGS,
+        cacheNote: "关键帧预览因浏览器缓存空间不足未保存，核心文案和视频状态已保存。",
+      }));
+    } catch {
+      // 浏览器缓存被禁用或空间已满时，不影响工具本身继续使用。
+    }
+  }
+}
+
+function clearSessionCache() {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(SESSION_CACHE_KEY);
+  } catch {
+    // 忽略浏览器缓存清理失败，页面状态仍会被重置。
+  }
+}
+
+function safeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function safeObject(value, fallback = null) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : fallback;
+}
+
+function safeStepState(value) {
+  return { ...DEFAULT_STEP_STATE, ...(safeObject(value, {}) || {}) };
+}
+
+function safeActiveTab(value) {
+  return VIEW_TABS.some((tab) => tab.key === value) ? value : "timeline";
+}
+
 function App() {
   const videoRef = useRef(null);
   const fileInputRef = useRef(null);
   const noticeTimerRef = useRef(null);
   const resolveAutoCloseTimerRef = useRef(null);
-  const [douyinUrl, setDouyinUrl] = useState("");
-  const [media, setMedia] = useState(null);
-  const [metadata, setMetadata] = useState(null);
-  const [frameInfo, setFrameInfo] = useState(null);
-  const [frameMode, setFrameMode] = useState("interval");
-  const [sampleInterval, setSampleInterval] = useState(0.25);
-  const [stripWatermarks, setStripWatermarks] = useState(true);
-  const [frames, setFrames] = useState([]);
-  const [transcript, setTranscript] = useState("");
-  const [asrArtifacts, setAsrArtifacts] = useState(null);
-  const [asrSubtitleCount, setAsrSubtitleCount] = useState(0);
-  const [visualText, setVisualText] = useState("");
-  const [tags, setTags] = useState([]);
-  const [ocrArtifacts, setOcrArtifacts] = useState(null);
-  const [ocrSubtitleCount, setOcrSubtitleCount] = useState(0);
-  const [variants, setVariants] = useState([]);
-  const [selectedVariant, setSelectedVariant] = useState(0);
-  const [lengthMode, setLengthMode] = useState("标准");
-  const [creativity, setCreativity] = useState(0.62);
+  const ocrPollTimerRef = useRef(null);
+  const cachedSession = useMemo(() => readSessionCache(), []);
+  const [douyinUrl, setDouyinUrl] = useState(cachedSession.douyinUrl || "");
+  const [media, setMedia] = useState(safeObject(cachedSession.media, null));
+  const [metadata, setMetadata] = useState(safeObject(cachedSession.metadata, null));
+  const [frameInfo, setFrameInfo] = useState(safeObject(cachedSession.frameInfo, null));
+  const [frameMode, setFrameMode] = useState(cachedSession.frameMode === "every-frame" ? "every-frame" : "interval");
+  const [sampleInterval, setSampleInterval] = useState(Number(cachedSession.sampleInterval || 0.25));
+  const [stripWatermarks, setStripWatermarks] = useState(cachedSession.stripWatermarks !== false);
+  const [frames, setFrames] = useState(safeArray(cachedSession.frames));
+  const [transcript, setTranscript] = useState(cachedSession.transcript || "");
+  const [asrArtifacts, setAsrArtifacts] = useState(safeObject(cachedSession.asrArtifacts, null));
+  const [asrSubtitleCount, setAsrSubtitleCount] = useState(Number(cachedSession.asrSubtitleCount || 0));
+  const [visualText, setVisualText] = useState(cachedSession.visualText || "");
+  const [tags, setTags] = useState(safeArray(cachedSession.tags));
+  const [ocrArtifacts, setOcrArtifacts] = useState(safeObject(cachedSession.ocrArtifacts, null));
+  const [ocrSubtitleCount, setOcrSubtitleCount] = useState(Number(cachedSession.ocrSubtitleCount || 0));
+  const [variants, setVariants] = useState(safeArray(cachedSession.variants));
+  const [selectedVariant, setSelectedVariant] = useState(Number(cachedSession.selectedVariant || 0));
+  const [lengthMode, setLengthMode] = useState(cachedSession.lengthMode || "标准");
+  const [outputLanguage, setOutputLanguage] = useState(cachedSession.outputLanguage || "简体中文");
+  const [creativity, setCreativity] = useState(Number(cachedSession.creativity ?? 0.62));
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [settingsDraft, setSettingsDraft] = useState(DEFAULT_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsNotice, setSettingsNotice] = useState("");
   const [asrProfile, setAsrProfile] = useState(null);
-  const [resolveSteps, setResolveSteps] = useState([]);
+  const [resolveSteps, setResolveSteps] = useState(safeArray(cachedSession.resolveSteps));
   const [resolvePanelOpen, setResolvePanelOpen] = useState(false);
+  const [ocrPanelOpen, setOcrPanelOpen] = useState(false);
+  const [ocrJob, setOcrJob] = useState(safeObject(cachedSession.ocrJob, null));
+  const [diffVariant, setDiffVariant] = useState(null);
+  const [diffPanelOpen, setDiffPanelOpen] = useState(false);
   const [busy, setBusy] = useState("");
   const [notice, setNoticeState] = useState("");
-  const [activeTab, setActiveTab] = useState("timeline");
-  const [logs, setLogs] = useState(["等待输入抖音链接，或上传本地视频开始。"]);
-  const [stepState, setStepState] = useState({
-    source: "idle",
-    download: "idle",
-    asr: "idle",
-    ocr: "idle",
-    merge: "idle",
-    rewrite: "idle",
-  });
+  const [activeTab, setActiveTab] = useState(safeActiveTab(cachedSession.activeTab));
+  const [logs, setLogs] = useState(safeArray(cachedSession.logs).length ? safeArray(cachedSession.logs) : DEFAULT_LOGS);
+  const [stepState, setStepState] = useState(safeStepState(cachedSession.stepState));
 
   const sourceText = useMemo(() => [transcript, visualText].filter(Boolean).join("\n\n"), [transcript, visualText]);
   const selectedRewrite = variants[selectedVariant];
-  const canUseModel = Boolean(settings.model && settings.apiKeySaved && settings.baseUrl);
+  const activeAi = getActiveAiConfig(settings);
+  const canUseModel = activeAi.ready;
   const fileSize = metadata?.size || media?.size || 0;
   const effectiveFps = frameInfo?.fps || media?.fps || 0;
   const effectiveFrameCount = frameInfo?.frameCount || media?.frameCount || 0;
   const expectedFrameCount = estimateCaptureCount({ mode: frameMode, duration: metadata?.duration, fps: effectiveFps, frameCount: effectiveFrameCount, interval: sampleInterval });
   const asrSrtUrl = asrArtifacts?.srt;
   const ocrSrtUrl = ocrArtifacts?.srt;
+  const ocrProgress = Math.max(0, Math.min(100, Math.round(Number(ocrJob?.progress || 0))));
+  const ocrStatusText = ocrJob?.status === "done" ? "已完成" : ocrJob?.status === "error" ? "失败" : ocrJob ? "运行中" : "未开始";
+  const diffParts = useMemo(() => buildTextDiff(sourceText, diffVariant?.text || ""), [sourceText, diffVariant]);
 
   useEffect(() => {
     loadSettings();
   }, []);
 
   useEffect(() => {
+    if (cachedSession.media?.id) {
+      loadMediaInfo(cachedSession.media.id);
+    }
+    if (cachedSession.ocrJob?.id && ["queued", "running"].includes(cachedSession.ocrJob.status)) {
+      setBusy("ocr");
+      setOcrPanelOpen(true);
+      pollOcrStatus(cachedSession.ocrJob.id);
+    }
+  }, []);
+
+  useEffect(() => {
+    writeSessionCache({
+      version: 2,
+      updatedAt: Date.now(),
+      douyinUrl,
+      media,
+      metadata,
+      frameInfo,
+      frameMode,
+      sampleInterval,
+      stripWatermarks,
+      frames,
+      transcript,
+      asrArtifacts,
+      asrSubtitleCount,
+      visualText,
+      tags,
+      ocrArtifacts,
+      ocrSubtitleCount,
+      variants,
+      selectedVariant,
+      lengthMode,
+      outputLanguage,
+      creativity,
+      resolveSteps,
+      ocrJob,
+      activeTab,
+      logs,
+      stepState,
+    });
+  }, [
+    douyinUrl,
+    media,
+    metadata,
+    frameInfo,
+    frameMode,
+    sampleInterval,
+    stripWatermarks,
+    frames,
+    transcript,
+    asrArtifacts,
+    asrSubtitleCount,
+    visualText,
+    tags,
+    ocrArtifacts,
+    ocrSubtitleCount,
+    variants,
+    selectedVariant,
+    lengthMode,
+    outputLanguage,
+    creativity,
+    resolveSteps,
+    ocrJob,
+    activeTab,
+    logs,
+    stepState,
+  ]);
+
+  useEffect(() => {
     return () => {
       clearNoticeTimer();
       clearResolveAutoCloseTimer();
+      clearOcrPollTimer();
     };
   }, []);
 
@@ -174,6 +342,12 @@ function App() {
     }, delay);
   }
 
+  function clearOcrPollTimer() {
+    if (!ocrPollTimerRef.current) return;
+    window.clearTimeout(ocrPollTimerRef.current);
+    ocrPollTimerRef.current = null;
+  }
+
   function updateStep(key, state) {
     setStepState((current) => ({ ...current, [key]: state }));
   }
@@ -186,17 +360,13 @@ function App() {
     setTags([]);
     setOcrArtifacts(null);
     setOcrSubtitleCount(0);
+    setOcrJob(null);
+    setOcrPanelOpen(false);
+    clearOcrPollTimer();
     setVariants([]);
     setSelectedVariant(0);
     setFrames([]);
-    setStepState({
-      source: "idle",
-      download: "idle",
-      asr: "idle",
-      ocr: "idle",
-      merge: "idle",
-      rewrite: "idle",
-    });
+    setStepState({ ...DEFAULT_STEP_STATE });
   }
 
   function clearCurrentMedia(message) {
@@ -207,6 +377,41 @@ function App() {
     updateStep("source", "error");
     updateStep("download", "error");
     if (message) setNotice(message);
+  }
+
+  function handleResetWorkspace() {
+    clearSessionCache();
+    clearNoticeTimer();
+    clearResolveAutoCloseTimer();
+    clearOcrPollTimer();
+    setDouyinUrl("");
+    setMedia(null);
+    setMetadata(null);
+    setFrameInfo(null);
+    setFrameMode("interval");
+    setSampleInterval(0.25);
+    setStripWatermarks(true);
+    setTranscript("");
+    setAsrArtifacts(null);
+    setAsrSubtitleCount(0);
+    setVisualText("");
+    setTags([]);
+    setOcrArtifacts(null);
+    setOcrSubtitleCount(0);
+    setOcrJob(null);
+    setOcrPanelOpen(false);
+    setResolveSteps([]);
+    setResolvePanelOpen(false);
+    setDiffVariant(null);
+    setDiffPanelOpen(false);
+    setVariants([]);
+    setSelectedVariant(0);
+    setFrames([]);
+    setBusy("");
+    setActiveTab("timeline");
+    setLogs(DEFAULT_LOGS);
+    setStepState({ ...DEFAULT_STEP_STATE });
+    setNotice("已重置当前任务。刷新页面也会保持空白状态，直到重新解析或上传视频。");
   }
 
   async function api(path, options = {}) {
@@ -229,7 +434,7 @@ function App() {
       const data = await api("/api/settings");
       const next = { ...DEFAULT_SETTINGS, ...data, transcriptionModel: normalizeTranscriptionModel(data.transcriptionModel) };
       setSettings(next);
-      setSettingsDraft({ ...next, apiKey: "" });
+      setSettingsDraft({ ...next, apiKey: "", deepseekApiKey: "" });
     } catch (error) {
       addLog(`读取 AI 设置失败：${error.message}`);
     }
@@ -400,11 +605,11 @@ function App() {
     }
     const link = document.createElement("a");
     link.href = media.url;
-    link.download = media.originalName || media.fileName || "video.mp4";
+    link.download = getVideoDownloadName(media);
     document.body.appendChild(link);
     link.click();
     link.remove();
-    addLog("已触发视频下载。");
+    addLog(`已触发视频下载：${link.download}`);
   }
 
   async function handleCaptureFrames() {
@@ -463,7 +668,11 @@ function App() {
       const data = await api("/api/transcribe-media", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mediaId: media.id, model: normalizeTranscriptionModel(settings.transcriptionModel) }),
+        body: JSON.stringify({
+          mediaId: media.id,
+          model: normalizeTranscriptionModel(settings.transcriptionModel),
+          simplifiedOnly: Boolean(settings.asrSimplifiedOnly),
+        }),
       });
       setTranscript(data.text || "");
       setAsrArtifacts(data.artifacts || null);
@@ -481,19 +690,71 @@ function App() {
     }
   }
 
+  function applyOcrResult(data) {
+    setVisualText(data.visualText || "");
+    setTags(data.tags || []);
+    setOcrArtifacts(data.artifacts || null);
+    setOcrSubtitleCount(Number(data.subtitleCount || 0));
+    if (data.info) setFrameInfo(data.info);
+    updateStep("ocr", data.visualText || data.tags?.length ? "done" : "idle");
+    updateStep("merge", transcript || data.visualText ? "done" : "idle");
+    const filteredCount = Number(data.filteredWatermarkCount || 0);
+    addLog(data.visualText ? `后端 OCR 完成：${data.mode === "every-frame" ? "全帧" : `每 ${data.sampleInterval}s`}，已去重并过滤 ${filteredCount} 个固定 Logo/水印项。` : `后端 OCR 完成，过滤 ${filteredCount} 个固定 Logo/水印项，但未读取到可用文字。`);
+    setNotice(data.visualText ? `OCR 识别完成，已合并去重并过滤固定 Logo/水印（${filteredCount} 项）。` : `OCR 已完成，已过滤固定 Logo/水印（${filteredCount} 项），但没有识别到可用文字。`);
+  }
+
+  async function pollOcrStatus(jobId) {
+    clearOcrPollTimer();
+    try {
+      const status = await api(`/api/extract-subtitles/status/${jobId}`);
+      setOcrJob(status);
+      if (status.status === "done") {
+        if (status.result) applyOcrResult(status.result);
+        setBusy((current) => (current === "ocr" ? "" : current));
+        return;
+      }
+      if (status.status === "error") {
+        updateStep("ocr", "error");
+        setNotice(status.error || "OCR 识别失败。");
+        addLog(`OCR 识别失败：${status.error || "未知错误"}`);
+        setBusy((current) => (current === "ocr" ? "" : current));
+        return;
+      }
+      ocrPollTimerRef.current = window.setTimeout(() => pollOcrStatus(jobId), 850);
+    } catch (error) {
+      updateStep("ocr", "error");
+      setNotice(error.message);
+      addLog(`OCR 进度读取失败：${error.message}`);
+      setBusy((current) => (current === "ocr" ? "" : current));
+    }
+  }
+
   async function handleOcr() {
     if (!media) {
       setNotice("请先上传或解析视频。");
       return;
     }
+    clearOcrPollTimer();
     setBusy("ocr");
     updateStep("ocr", "active");
     setNotice("");
+    setOcrPanelOpen(true);
     try {
       const mode = frameMode === "every-frame" ? "every-frame" : "interval";
       const interval = Math.max(0.05, Number(sampleInterval) || 0.25);
-      setNotice(mode === "every-frame" ? "后端正在快速抽帧并逐帧 OCR，不需要等待视频播放完成。" : `后端正在快速抽帧并 OCR，每 ${interval.toFixed(2)} 秒读取 1 帧。`);
-      const data = await api("/api/extract-subtitles", {
+      const initialJob = {
+        status: "queued",
+        phase: mode === "every-frame" ? "准备全帧 OCR" : `准备按 ${interval.toFixed(2)} 秒/帧 OCR`,
+        progress: 0,
+        processed: 0,
+        plannedTotal: expectedFrameCount || 0,
+        detections: 0,
+        finalEvents: 0,
+        logs: ["OCR 任务已提交，正在启动本地识别引擎。"],
+      };
+      setOcrJob(initialJob);
+      setNotice(mode === "every-frame" ? "OCR 已开始：后端正在快速逐帧读取，不需要等待视频播放完成。" : `OCR 已开始：后端每 ${interval.toFixed(2)} 秒读取 1 帧。`);
+      const job = await api("/api/extract-subtitles/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -503,21 +764,13 @@ function App() {
           includeWatermark: !stripWatermarks,
         }),
       });
-      setVisualText(data.visualText || "");
-      setTags(data.tags || []);
-      setOcrArtifacts(data.artifacts || null);
-      setOcrSubtitleCount(Number(data.subtitleCount || 0));
-      if (data.info) setFrameInfo(data.info);
-      updateStep("ocr", data.visualText || data.tags?.length ? "done" : "idle");
-      updateStep("merge", transcript || data.visualText ? "done" : "idle");
-      const filteredCount = Number(data.filteredWatermarkCount || 0);
-      addLog(data.visualText ? `后端 OCR 完成：${data.mode === "every-frame" ? "全帧" : `每 ${data.sampleInterval}s`}，已去重并过滤 ${filteredCount} 个固定 Logo/水印项。` : `后端 OCR 完成，过滤 ${filteredCount} 个固定 Logo/水印项，但未读取到可用文字。`);
-      setNotice(data.visualText ? `OCR 识别完成，已合并去重并过滤固定 Logo/水印（${filteredCount} 项）。` : `OCR 已完成，已过滤固定 Logo/水印（${filteredCount} 项），但没有识别到可用文字。`);
+      setOcrJob(job);
+      addLog("OCR 任务已启动，可关闭进度面板，识别会继续运行。");
+      pollOcrStatus(job.id);
     } catch (error) {
       updateStep("ocr", "error");
       setNotice(error.message);
       addLog(`OCR 识别失败：${error.message}`);
-    } finally {
       setBusy("");
     }
   }
@@ -541,8 +794,10 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           text: sourceText,
-          model: settings.model,
+          provider: activeAi.provider,
+          model: activeAi.model,
           lengthMode,
+          outputLanguage,
           creativity,
         }),
       });
@@ -573,8 +828,18 @@ function App() {
     }
   }
 
-  async function handleFetchModels() {
-    setBusy("models");
+  function openDiffPanel(variant) {
+    if (!sourceText.trim() || !variant?.text?.trim()) {
+      setNotice("没有可对比的原文或改写文案。");
+      return;
+    }
+    setDiffVariant(variant);
+    setDiffPanelOpen(true);
+  }
+
+  async function handleFetchModels(provider = settingsDraft.activeAiProvider || "cpa") {
+    const isDeepSeek = provider === "deepseek";
+    setBusy(isDeepSeek ? "models-deepseek" : "models-cpa");
     setNotice("");
     setSettingsNotice("");
     try {
@@ -582,18 +847,35 @@ function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          baseUrl: settingsDraft.baseUrl,
-          apiKey: settingsDraft.apiKey,
+          provider,
+          baseUrl: isDeepSeek ? settingsDraft.deepseekBaseUrl : settingsDraft.baseUrl,
+          apiKey: isDeepSeek ? settingsDraft.deepseekApiKey : settingsDraft.apiKey,
         }),
       });
       const first = data.models[0] || "";
-      setSettingsDraft((draft) => ({ ...draft, models: data.models, model: draft.model || first }));
-      setSettingsNotice(`已获取 ${data.models.length} 个模型。`);
+      setSettingsDraft((draft) => isDeepSeek
+        ? { ...draft, deepseekModels: data.models, deepseekModel: draft.deepseekModel || first }
+        : { ...draft, models: data.models, model: draft.model || first });
+      setSettingsNotice(`已获取 ${AI_PROVIDERS[provider]?.label || "当前接入"} ${data.models.length} 个模型。`);
     } catch (error) {
       setSettingsNotice(`连接失败：${error.message || "请检查 Base URL、API Key 和网络连接。"}`);
     } finally {
       setBusy("");
     }
+  }
+
+  function handleEnableProvider(provider) {
+    setSettingsDraft((draft) => ({ ...draft, activeAiProvider: provider }));
+    setSettingsNotice(`已选择启用 ${AI_PROVIDERS[provider]?.label || provider}，点击保存后生效。`);
+  }
+
+  function openApiKeyPage(provider) {
+    const url = AI_PROVIDERS[provider]?.keyUrl;
+    if (!url) {
+      setSettingsNotice("CPA 是自定义反代服务，请到你的 CPA 服务商或管理后台获取 API Key。");
+      return;
+    }
+    window.open(url, "_blank", "noopener,noreferrer");
   }
 
   async function handleDetectAsrProfile() {
@@ -628,7 +910,7 @@ function App() {
         body: JSON.stringify(settingsDraft),
       });
       setSettings({ ...DEFAULT_SETTINGS, ...data });
-      setSettingsDraft({ ...DEFAULT_SETTINGS, ...data, apiKey: "" });
+      setSettingsDraft({ ...DEFAULT_SETTINGS, ...data, apiKey: "", deepseekApiKey: "" });
       setSettingsOpen(false);
       setNotice("AI 设置已保存。");
       addLog("AI 设置已保存。");
@@ -658,7 +940,7 @@ function App() {
     try {
       const data = await api("/api/douyin-cookie/read", { method: "POST" });
       setSettings({ ...DEFAULT_SETTINGS, ...data });
-      setSettingsDraft((draft) => ({ ...draft, ...data, apiKey: "", douyinCookie: "" }));
+      setSettingsDraft((draft) => ({ ...draft, ...data, apiKey: "", deepseekApiKey: "", douyinCookie: "" }));
       const cookieInfo = data.douyinCookieInfo || {};
       const loginText = cookieInfo.hasLoginCookie || data.hasLoginCookie ? "已读取登录 Cookie" : "已读取游客 Cookie";
       setSettingsNotice(`${loginText}，共 ${cookieInfo.count || data.cookieCount || 0} 项，已保存到本地。下方会显示脱敏明细。`);
@@ -704,6 +986,10 @@ function App() {
             {busy === "upload" ? "上传中" : "上传视频"}
           </button>
           <input ref={fileInputRef} type="file" accept="video/*" hidden onChange={handleUpload} />
+          <button className="reset-command" type="button" onClick={handleResetWorkspace}>
+            <IconRefresh size={17} />
+            重置
+          </button>
           <button className="settings-command" type="button" onClick={() => setSettingsOpen(true)}>
             <IconSettings size={18} />
             AI 设置
@@ -771,9 +1057,35 @@ function App() {
               <IconDownload size={18} />
               下载视频
             </button>
-            <button className="secondary-button" type="button" onClick={handleCaptureFrames} disabled={busy === "frames"}>
-              <IconPhotoScan size={18} />
-              {busy === "frames" ? "抽帧中" : "按设置抽帧"}
+          </div>
+        </aside>
+
+        <section className="pipeline-zone panel">
+          <div className="panel-title">
+            <div>
+              <h2>复刻链路</h2>
+              <p>每一步只显示真实运行状态</p>
+            </div>
+            <span className={busy ? "live-pill running" : "live-pill"}>
+              {busy ? "运行中" : "待命"}
+            </span>
+          </div>
+          <div className="operation-actions">
+            <button type="button" onClick={handleCaptureFrames} disabled={busy === "frames"}>
+              <IconPhotoScan size={17} />
+              {busy === "frames" ? "抽帧中" : "抽帧预览"}
+            </button>
+            <button type="button" onClick={handleTranscribe} disabled={busy === "asr"}>
+              <IconMicrophone size={17} />
+              语音识别
+            </button>
+            <button type="button" onClick={handleOcr} disabled={busy === "ocr"}>
+              <IconScan size={17} />
+              OCR识别
+            </button>
+            <button className="accent" type="button" onClick={handleRewrite} disabled={busy === "rewrite"}>
+              <IconSparkles size={17} />
+              AI改写
             </button>
           </div>
           <section className="frame-settings" aria-label="抽帧设置">
@@ -801,19 +1113,20 @@ function App() {
             <div className="frame-estimate">
               预计抽取 <strong>{expectedFrameCount || "-"}</strong> 帧
             </div>
-            <p className="frame-help">后端直接读取视频帧，不需要等待视频播放完成；全帧预览会自动限量展示。</p>
           </section>
-        </aside>
-
-        <section className="pipeline-zone panel">
-          <div className="panel-title">
-            <div>
-              <h2>复刻链路</h2>
-              <p>每一步只显示真实运行状态</p>
-            </div>
-            <span className={busy ? "live-pill running" : "live-pill"}>
-              {busy ? "运行中" : "待命"}
-            </span>
+          <div className="progress-shortcuts">
+            {!!resolveSteps.length && (
+              <button className="resolve-toggle" type="button" onClick={() => setResolvePanelOpen(true)}>
+                <IconClock size={16} />
+                {busy === "douyin" ? "查看解析过程" : "解析记录"}
+              </button>
+            )}
+            {!!ocrJob && (
+              <button className="resolve-toggle" type="button" onClick={() => setOcrPanelOpen(true)}>
+                <IconScan size={16} />
+                查看 OCR 进度
+              </button>
+            )}
           </div>
           <div className="pipeline-list">
             {STEPS.map((step, index) => {
@@ -834,32 +1147,41 @@ function App() {
               );
             })}
           </div>
-          <div className="pipeline-actions">
-            <button type="button" onClick={handleTranscribe} disabled={busy === "asr"}>
-              <IconMicrophone size={17} />
-              语音识别
-            </button>
-            <button type="button" onClick={handleOcr} disabled={busy === "ocr"}>
-              <IconScan size={17} />
-              OCR识别
-            </button>
-            <button className="accent" type="button" onClick={handleRewrite} disabled={busy === "rewrite"}>
-              <IconSparkles size={17} />
-              AI改写
-            </button>
-          </div>
-          {!!resolveSteps.length && (
-            <button className="resolve-toggle" type="button" onClick={() => setResolvePanelOpen(true)}>
-              {busy === "douyin" ? "查看解析过程" : "查看最近解析记录"}
-            </button>
-          )}
+          <section className="timeline-panel">
+            <nav className="timeline-tabs" aria-label="分析视图">
+              {VIEW_TABS.map((tab) => (
+                <button className={activeTab === tab.key ? "active" : ""} key={tab.key} type="button" onClick={() => setActiveTab(tab.key)}>
+                  {tab.label}
+                </button>
+              ))}
+            </nav>
+            {activeTab === "timeline" && (
+              <TimelineView duration={metadata?.duration || 0} frames={frames} transcript={transcript} visualText={visualText} />
+            )}
+            {activeTab === "frames" && (
+              <div className="frame-strip">
+                {frames.length ? frames.map((frame, index) => (
+                  <div className="frame-chip" key={`${frame.time}-${index}`}>
+                    <img src={frame.image} alt={`关键帧 ${index + 1}`} />
+                    <span>{formatDuration(frame.time)}</span>
+                    <strong>真实抽帧</strong>
+                  </div>
+                )) : <div className="soft-empty">还没有关键帧。点击“抽帧预览”后显示。</div>}
+              </div>
+            )}
+            {activeTab === "logs" && (
+              <div className="log-list">
+                {logs.map((item) => <span key={item}>{item}</span>)}
+              </div>
+            )}
+          </section>
         </section>
 
         <aside className="copy-zone panel">
           <div className="panel-title compact">
             <div>
               <h2>文案智能看板</h2>
-              <p>{canUseModel ? `模型：${settings.model}` : "未配置 AI 模型"}</p>
+              <p>{canUseModel ? `模型：${activeAi.label} / ${activeAi.model}` : "未配置 AI 模型"}</p>
             </div>
             <button className="tiny-action" type="button" onClick={() => copyText(composeAllText(sourceText, variants), "全部内容")}>
               <IconCopy size={16} />
@@ -926,10 +1248,16 @@ function App() {
               <div className="variant-output">
                 <strong>{selectedRewrite.tone}</strong>
                 <p>{selectedRewrite.text}</p>
-                <button type="button" onClick={() => copyText(selectedRewrite.text, "改写文案")}>
-                  <IconCopy size={15} />
-                  复制改写文案
-                </button>
+                <div className="variant-action-row">
+                  <button type="button" onClick={() => copyText(selectedRewrite.text, "改写文案")}>
+                    <IconCopy size={15} />
+                    复制改写文案
+                  </button>
+                  <button type="button" onClick={() => openDiffPanel(selectedRewrite)}>
+                    <IconFileText size={15} />
+                    对比原文
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="soft-empty">没有真实改写结果。请先完成识别，再点击 AI改写。</div>
@@ -947,6 +1275,14 @@ function App() {
                 ))}
               </div>
             </div>
+            <label className="select-line">
+              <span>输出语言</span>
+              <select value={outputLanguage} onChange={(event) => setOutputLanguage(event.target.value)}>
+                {OUTPUT_LANGUAGE_OPTIONS.map((item) => (
+                  <option key={item} value={item}>{item}</option>
+                ))}
+              </select>
+            </label>
             <label className="range-line">
               <span>创意强度 {creativity.toFixed(2)}</span>
               <input min="0" max="1" step="0.01" type="range" value={creativity} onChange={(event) => setCreativity(Number(event.target.value))} />
@@ -954,34 +1290,6 @@ function App() {
           </section>
         </aside>
 
-        <section className="timeline-panel panel">
-          <nav className="timeline-tabs" aria-label="分析视图">
-            {VIEW_TABS.map((tab) => (
-              <button className={activeTab === tab.key ? "active" : ""} key={tab.key} type="button" onClick={() => setActiveTab(tab.key)}>
-                {tab.label}
-              </button>
-            ))}
-          </nav>
-          {activeTab === "timeline" && (
-            <TimelineView duration={metadata?.duration || 0} frames={frames} transcript={transcript} visualText={visualText} />
-          )}
-          {activeTab === "frames" && (
-            <div className="frame-strip">
-              {frames.length ? frames.map((frame, index) => (
-                <div className="frame-chip" key={`${frame.time}-${index}`}>
-                  <img src={frame.image} alt={`关键帧 ${index + 1}`} />
-                  <span>{formatDuration(frame.time)}</span>
-                  <strong>真实抽帧</strong>
-                </div>
-              )) : <div className="soft-empty">还没有关键帧。点击“抽取关键帧”后显示。</div>}
-            </div>
-          )}
-          {activeTab === "logs" && (
-            <div className="log-list">
-              {logs.map((item) => <span key={item}>{item}</span>)}
-            </div>
-          )}
-        </section>
       </section>
 
       {resolvePanelOpen && (
@@ -1007,13 +1315,129 @@ function App() {
         </section>
       )}
 
+      {ocrPanelOpen && (
+        <section className="modal-layer task-layer" role="dialog" aria-modal="true" aria-label="OCR 识别进度">
+          <div className="task-modal panel">
+            <div className="modal-head">
+              <div>
+                <h2>OCR 识别进度</h2>
+                <p>{ocrJob?.phase || "等待开始识别"}</p>
+              </div>
+              <button type="button" onClick={() => setOcrPanelOpen(false)} aria-label="隐藏 OCR 进度">
+                <IconX size={20} />
+              </button>
+            </div>
+            <div className={`task-progress ${ocrJob?.status || "idle"}`}>
+              <div className="task-progress-head">
+                <strong>{ocrStatusText}</strong>
+                <span>{ocrProgress}%</span>
+              </div>
+              <div className="task-meter" aria-label={`OCR 进度 ${ocrProgress}%`}>
+                <i style={{ width: `${ocrProgress}%` }} />
+              </div>
+            </div>
+            <div className="task-stats">
+              <div>
+                <span>已处理</span>
+                <strong>{ocrJob?.processed || 0}<em> / {ocrJob?.plannedTotal || expectedFrameCount || "-"}</em></strong>
+              </div>
+              <div>
+                <span>视频帧位</span>
+                <strong>{ocrJob?.currentFrame || 0}<em> / {ocrJob?.frameCount || effectiveFrameCount || "-"}</em></strong>
+              </div>
+              <div>
+                <span>文字候选</span>
+                <strong>{ocrJob?.detections || 0}</strong>
+              </div>
+              <div>
+                <span>SRT 字幕</span>
+                <strong>{ocrJob?.finalEvents || ocrSubtitleCount || 0}</strong>
+              </div>
+            </div>
+            {ocrJob?.error && (
+              <div className="modal-notice danger">
+                <IconAlertTriangle size={16} />
+                <span>{ocrJob.error}</span>
+              </div>
+            )}
+            <div className="task-body">
+              <section className="task-copy-preview">
+                <div className="copy-head">
+                  <h3>识别内容预览 <span>完成后自动同步到右侧结果区</span></h3>
+                  <button type="button" onClick={() => copyText(ocrJob?.result?.visualText || visualText, "OCR 文案")}>
+                    <IconCopy size={15} />
+                    复制
+                  </button>
+                </div>
+                <div className="task-copy-scroll">
+                  {ocrJob?.result?.visualText || visualText || (ocrJob?.status === "done" ? "本次 OCR 未识别到可用正文，已保留实时处理记录和 SRT 文件。" : "识别中，暂无可显示文本。")}
+                </div>
+                {ocrJob?.result?.artifacts?.srt && (
+                  <div className="artifact-row">
+                    <a href={ocrJob.result.artifacts.srt} target="_blank" rel="noreferrer">下载画面 SRT 字幕</a>
+                    <span>{ocrJob.result.subtitleCount ? `已生成 ${ocrJob.result.subtitleCount} 条时间线字幕` : "已生成时间线字幕文件"}</span>
+                  </div>
+                )}
+              </section>
+              <section className="task-log-panel">
+                <h3>实时处理记录</h3>
+                <div className="task-log-list">
+                  {(ocrJob?.logs?.length ? ocrJob.logs : ["暂无 OCR 运行记录。"]).slice().reverse().map((item, index) => (
+                    <span key={`${item}-${index}`}>{item}</span>
+                  ))}
+                </div>
+              </section>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {diffPanelOpen && diffVariant && (
+        <section className="modal-layer light-layer" role="dialog" aria-modal="true" aria-label="文案差异对比">
+          <div className="diff-modal panel">
+            <div className="modal-head">
+              <div>
+                <h2>文案差异对比</h2>
+                <p>{diffVariant.name}：绿色为新增/变化，红色为原文被删除或替换。</p>
+              </div>
+              <button type="button" onClick={() => setDiffPanelOpen(false)} aria-label="关闭文案差异对比">
+                <IconX size={20} />
+              </button>
+            </div>
+            <div className="diff-legend">
+              <span className="same">保留</span>
+              <span className="insert">新增/变化</span>
+              <span className="delete">删除/被替换</span>
+            </div>
+            <div className="diff-grid">
+              <section>
+                <h3>原文</h3>
+                <div className="diff-text">
+                  {diffParts.original.map((part, index) => (
+                    <mark className={part.type} key={`${part.text}-${index}`}>{part.text}</mark>
+                  ))}
+                </div>
+              </section>
+              <section>
+                <h3>{diffVariant.name}</h3>
+                <div className="diff-text">
+                  {diffParts.revised.map((part, index) => (
+                    <mark className={part.type} key={`${part.text}-${index}`}>{part.text}</mark>
+                  ))}
+                </div>
+              </section>
+            </div>
+          </div>
+        </section>
+      )}
+
       {settingsOpen && (
         <section className="modal-layer" role="dialog" aria-modal="true" aria-label="AI 设置">
           <div className="settings-modal panel">
             <div className="modal-head">
               <div>
                 <h2>AI 改写与本地识别设置</h2>
-                <p>AI 改写需要填写兼容 OpenAI /v1 的 Base URL 和 API Key；本地语音识别无需 API Key。</p>
+                <p>AI 改写可启用 CPA 反代或 DeepSeek 官方；本地语音识别无需 API Key。</p>
               </div>
               <button type="button" onClick={() => setSettingsOpen(false)} aria-label="关闭设置">
                 <IconX size={20} />
@@ -1025,31 +1449,88 @@ function App() {
                 <span>{settingsNotice}</span>
               </div>
             )}
-            <label>
-              <span>Base URL</span>
-              <input value={settingsDraft.baseUrl} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, baseUrl: event.target.value }))} placeholder="例如：https://api.openai.com/v1" />
-            </label>
-            <label>
-              <span>AI 改写 API Key {settings.apiKeySaved ? "（已保存，可留空不改）" : ""}</span>
-              <input type="password" value={settingsDraft.apiKey || ""} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, apiKey: event.target.value }))} placeholder="只保存在本地后端配置文件" />
-            </label>
-            <div className="modal-actions">
-              <button type="button" onClick={handleFetchModels} disabled={busy === "models"}>
-                <IconRefresh size={16} />
-                {busy === "models" ? "获取中" : "获取模型"}
-              </button>
+            <section className={`ai-provider-card ${settingsDraft.activeAiProvider === "cpa" ? "active" : ""}`}>
+              <div className="ai-provider-head">
+                <div>
+                  <strong>CPA 反代接入</strong>
+                  <span>使用你自己的 CPA Base URL 和 API Key</span>
+                </div>
+                <button type="button" onClick={() => handleEnableProvider("cpa")}>
+                  <IconCheck size={15} />
+                  {settingsDraft.activeAiProvider === "cpa" ? "已启用" : "启用"}
+                </button>
+              </div>
+              <label>
+                <span>CPA Base URL</span>
+                <input value={settingsDraft.baseUrl} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, baseUrl: event.target.value }))} placeholder="例如：https://api.openai.com/v1" />
+              </label>
+              <label>
+                <span>CPA API Key {settings.apiKeySaved ? "（已保存，可留空不改）" : ""}</span>
+                <input type="password" value={settingsDraft.apiKey || ""} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, apiKey: event.target.value }))} placeholder="只保存在本地后端配置文件" />
+              </label>
+              <div className="modal-actions">
+                <button type="button" onClick={() => handleFetchModels("cpa")} disabled={busy === "models-cpa"}>
+                  <IconRefresh size={16} />
+                  {busy === "models-cpa" ? "获取中" : "获取模型"}
+                </button>
+                <button type="button" onClick={() => openApiKeyPage("cpa")}>
+                  <IconKey size={16} />
+                  API Key 来源
+                </button>
+              </div>
+              <label>
+                <span>CPA 改写模型</span>
+                <select value={settingsDraft.model} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, model: event.target.value }))}>
+                  <option value="">先获取模型列表</option>
+                  {settingsDraft.models.map((item) => <option key={item} value={item}>{item}</option>)}
+                </select>
+              </label>
+            </section>
+
+            <section className={`ai-provider-card ${settingsDraft.activeAiProvider === "deepseek" ? "active" : ""}`}>
+              <div className="ai-provider-head">
+                <div>
+                  <strong>DeepSeek 官方接入</strong>
+                  <span>适合直接使用 DeepSeek 官方 API Key</span>
+                </div>
+                <button type="button" onClick={() => handleEnableProvider("deepseek")}>
+                  <IconCheck size={15} />
+                  {settingsDraft.activeAiProvider === "deepseek" ? "已启用" : "启用"}
+                </button>
+              </div>
+              <label>
+                <span>DeepSeek Base URL</span>
+                <input value={settingsDraft.deepseekBaseUrl} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, deepseekBaseUrl: event.target.value }))} placeholder="https://api.deepseek.com" />
+              </label>
+              <label>
+                <span>DeepSeek API Key {settings.deepseekApiKeySaved ? "（已保存，可留空不改）" : ""}</span>
+                <input type="password" value={settingsDraft.deepseekApiKey || ""} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, deepseekApiKey: event.target.value }))} placeholder="只保存在本地后端配置文件" />
+              </label>
+              <div className="modal-actions">
+                <button type="button" onClick={() => handleFetchModels("deepseek")} disabled={busy === "models-deepseek"}>
+                  <IconRefresh size={16} />
+                  {busy === "models-deepseek" ? "获取中" : "获取模型"}
+                </button>
+                <button type="button" onClick={() => openApiKeyPage("deepseek")}>
+                  <IconKey size={16} />
+                  申请 API Key
+                </button>
+              </div>
+              <label>
+                <span>DeepSeek 改写模型</span>
+                <select value={settingsDraft.deepseekModel} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, deepseekModel: event.target.value }))}>
+                  <option value="">先获取模型列表</option>
+                  {settingsDraft.deepseekModels.map((item) => <option key={item} value={item}>{item}</option>)}
+                </select>
+              </label>
+            </section>
+
+            <div className="modal-actions single-action">
               <button className="save" type="button" onClick={handleSaveSettings} disabled={busy === "save-settings"}>
                 <IconShieldCheck size={16} />
-                保存
+                保存全部设置
               </button>
             </div>
-            <label>
-              <span>默认改写模型</span>
-              <select value={settingsDraft.model} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, model: event.target.value }))}>
-                <option value="">先获取模型列表</option>
-                {settingsDraft.models.map((item) => <option key={item} value={item}>{item}</option>)}
-              </select>
-            </label>
             <label>
               <span>本地语音识别模型</span>
               <select value={settingsDraft.transcriptionModel} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, transcriptionModel: event.target.value }))}>
@@ -1057,6 +1538,10 @@ function App() {
                   <option key={item.value} value={item.value}>{item.label} - {item.hint}</option>
                 ))}
               </select>
+            </label>
+            <label className="check-line settings-check-line">
+              <input type="checkbox" checked={Boolean(settingsDraft.asrSimplifiedOnly)} onChange={(event) => setSettingsDraft((draft) => ({ ...draft, asrSimplifiedOnly: event.target.checked }))} />
+              <span>语音识别结果强制输出简体中文</span>
             </label>
             <div className="asr-profile-card">
               <div className="asr-profile-head">
@@ -1179,6 +1664,113 @@ function stateLabel(state) {
   if (state === "active") return "运行";
   if (state === "error") return "失败";
   return "待命";
+}
+
+function buildTextDiff(originalText, revisedText) {
+  const maxChars = 2200;
+  const original = Array.from(String(originalText || "").slice(0, maxChars));
+  const revised = Array.from(String(revisedText || "").slice(0, maxChars));
+  const rows = original.length + 1;
+  const cols = revised.length + 1;
+  const dp = Array.from({ length: rows }, () => new Uint16Array(cols));
+
+  for (let i = original.length - 1; i >= 0; i -= 1) {
+    for (let j = revised.length - 1; j >= 0; j -= 1) {
+      dp[i][j] = original[i] === revised[j]
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  const originalParts = [];
+  const revisedParts = [];
+  let i = 0;
+  let j = 0;
+  while (i < original.length && j < revised.length) {
+    if (original[i] === revised[j]) {
+      originalParts.push({ type: "same", text: original[i] });
+      revisedParts.push({ type: "same", text: revised[j] });
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      originalParts.push({ type: "delete", text: original[i] });
+      i += 1;
+    } else {
+      revisedParts.push({ type: "insert", text: revised[j] });
+      j += 1;
+    }
+  }
+  while (i < original.length) {
+    originalParts.push({ type: "delete", text: original[i] });
+    i += 1;
+  }
+  while (j < revised.length) {
+    revisedParts.push({ type: "insert", text: revised[j] });
+    j += 1;
+  }
+  if (String(originalText || "").length > maxChars) originalParts.push({ type: "delete", text: "..." });
+  if (String(revisedText || "").length > maxChars) revisedParts.push({ type: "insert", text: "..." });
+  return {
+    original: mergeDiffParts(originalParts),
+    revised: mergeDiffParts(revisedParts),
+  };
+}
+
+function mergeDiffParts(parts) {
+  const merged = [];
+  for (const part of parts) {
+    const previous = merged[merged.length - 1];
+    if (previous?.type === part.type) previous.text += part.text;
+    else merged.push({ ...part });
+  }
+  return merged.filter((part) => part.text);
+}
+
+function getActiveAiConfig(settings) {
+  const provider = settings?.activeAiProvider === "deepseek" ? "deepseek" : "cpa";
+  if (provider === "deepseek") {
+    return {
+      provider,
+      label: AI_PROVIDERS.deepseek.label,
+      baseUrl: settings?.deepseekBaseUrl || DEFAULT_SETTINGS.deepseekBaseUrl,
+      model: settings?.deepseekModel || "",
+      ready: Boolean((settings?.deepseekBaseUrl || DEFAULT_SETTINGS.deepseekBaseUrl) && settings?.deepseekApiKeySaved && settings?.deepseekModel),
+    };
+  }
+  return {
+    provider,
+    label: AI_PROVIDERS.cpa.label,
+    baseUrl: settings?.baseUrl || "",
+    model: settings?.model || "",
+    ready: Boolean(settings?.baseUrl && settings?.apiKeySaved && settings?.model),
+  };
+}
+
+function getVideoDownloadName(media) {
+  const originalName = String(media?.originalName || "").trim();
+  const storedName = String(media?.fileName || "").trim();
+  const originalIsUrl = /^https?:\/\//i.test(originalName);
+  const preferred = !originalIsUrl && VIDEO_EXTENSION_PATTERN.test(originalName)
+    ? originalName
+    : VIDEO_EXTENSION_PATTERN.test(storedName)
+      ? storedName
+      : !originalIsUrl && originalName
+        ? originalName
+        : media?.id
+          ? `douyin-${media.id}`
+          : "video";
+  let safeName = preferred
+    .split(/[?#]/)[0]
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .replace(/^\.+|\.+$/g, "")
+    .trim();
+  if (!safeName) safeName = "video";
+  if (!VIDEO_EXTENSION_PATTERN.test(safeName)) {
+    const ext = String(media?.mimeType || "").includes("webm") ? ".webm" : ".mp4";
+    safeName = `${safeName}${ext}`;
+  }
+  return safeName;
 }
 
 function formatBytes(bytes) {

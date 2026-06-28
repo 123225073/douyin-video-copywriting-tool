@@ -1,9 +1,10 @@
 import express from "express";
 import multer from "multer";
+import OpenCC from "opencc-js";
 import path from "node:path";
 import fs from "node:fs";
 import { promises as fsp } from "node:fs";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import os from "node:os";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -24,6 +25,7 @@ const frameExtractorScript = path.join(scriptsDir, "extract_frames.py");
 const videoOcrScript = path.join(scriptsDir, "video_ocr.py");
 const transcriptionScript = path.join(scriptsDir, "transcribe_media.py");
 const chromeUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+const deepseekDefaultBaseUrl = "https://api.deepseek.com";
 const douyinHeaders = {
   "User-Agent": chromeUserAgent,
   "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -36,6 +38,15 @@ const localAsrModels = [
   { model: "Systran/faster-whisper-medium", shortName: "medium", minRamGb: 16, minGpuGb: 6, tier: "高准确", note: "中文口播更好，CPU 会明显更慢" },
   { model: "large-v3", shortName: "large-v3", minRamGb: 32, minGpuGb: 10, tier: "最高准确", note: "适合高配显卡或愿意等待的高配电脑" },
 ];
+const allowedVideoExtensions = new Set([".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi"]);
+const mimeVideoExtensions = new Map([
+  ["video/mp4", ".mp4"],
+  ["video/x-m4v", ".m4v"],
+  ["video/quicktime", ".mov"],
+  ["video/webm", ".webm"],
+  ["video/x-matroska", ".mkv"],
+  ["video/x-msvideo", ".avi"],
+]);
 await fsp.mkdir(uploadDir, { recursive: true });
 await fsp.mkdir(ocrRunDir, { recursive: true });
 await fsp.mkdir(asrRunDir, { recursive: true });
@@ -44,6 +55,9 @@ await fsp.mkdir(douyinBrowserProfileDir, { recursive: true });
 const app = express();
 const port = Number(process.env.PORT || 5176);
 let douyinCookieContext = null;
+const ocrJobs = new Map();
+const toSimplifiedChinese = OpenCC.Converter({ from: "tw", to: "cn" });
+const toTraditionalChinese = OpenCC.Converter({ from: "cn", to: "tw" });
 
 app.use(express.json({ limit: "40mb" }));
 app.use("/media", express.static(uploadDir));
@@ -53,7 +67,7 @@ app.use("/asr-output", express.static(asrRunDir));
 const storage = multer.diskStorage({
   destination: uploadDir,
   filename(_req, file, cb) {
-    const ext = path.extname(file.originalname || "").toLowerCase() || ".mp4";
+    const ext = getUploadVideoExtension(file.originalname, file.mimetype);
     cb(null, `${Date.now()}-${randomId()}${ext}`);
   },
 });
@@ -93,6 +107,13 @@ function cleanUploadName(name) {
   }
 }
 
+function getUploadVideoExtension(name, mimeType) {
+  const ext = path.extname(cleanUploadName(name)).toLowerCase();
+  if (allowedVideoExtensions.has(ext)) return ext;
+  const mime = String(mimeType || "").toLowerCase().split(";")[0];
+  return mimeVideoExtensions.get(mime) || ".mp4";
+}
+
 async function readJson(filePath, fallback) {
   try {
     return JSON.parse(await fsp.readFile(filePath, "utf8"));
@@ -113,12 +134,18 @@ function normalizeTranscriptionModel(model) {
 
 async function getSettings() {
   return readJson(settingsPath, {
+    activeAiProvider: "cpa",
     baseUrl: "",
     apiKey: "",
+    deepseekBaseUrl: deepseekDefaultBaseUrl,
+    deepseekApiKey: "",
+    deepseekModel: "",
+    deepseekModels: [],
     douyinCookie: "",
     douyinCookieJar: [],
     model: "",
     transcriptionModel: "Systran/faster-whisper-small",
+    asrSimplifiedOnly: false,
     models: [],
   });
 }
@@ -126,11 +153,17 @@ async function getSettings() {
 function redactSettings(settings) {
   const cookieInfo = describeCookie(settings.douyinCookie || "");
   return {
+    activeAiProvider: settings.activeAiProvider === "deepseek" ? "deepseek" : "cpa",
     baseUrl: settings.baseUrl || "",
     model: settings.model || "",
+    deepseekBaseUrl: settings.deepseekBaseUrl || deepseekDefaultBaseUrl,
+    deepseekModel: settings.deepseekModel || "",
+    deepseekModels: Array.isArray(settings.deepseekModels) ? settings.deepseekModels : [],
     transcriptionModel: normalizeTranscriptionModel(settings.transcriptionModel),
+    asrSimplifiedOnly: Boolean(settings.asrSimplifiedOnly),
     models: Array.isArray(settings.models) ? settings.models : [],
     apiKeySaved: Boolean(settings.apiKey),
+    deepseekApiKeySaved: Boolean(settings.deepseekApiKey),
     douyinCookieSaved: Boolean(settings.douyinCookie),
     douyinCookieInfo: cookieInfo,
   };
@@ -172,6 +205,21 @@ function requireApiConfig(settings) {
   if (!baseUrl) throw new Error("请先填写 CPA Base URL。");
   if (!settings.apiKey) throw new Error("请先填写 CPA API Key。");
   return baseUrl;
+}
+
+function getRewriteApiConfig(settings, requestedProvider = "") {
+  const provider = requestedProvider === "deepseek" || settings.activeAiProvider === "deepseek" ? "deepseek" : "cpa";
+  if (provider === "deepseek") {
+    const baseUrl = normalizeBaseUrl(settings.deepseekBaseUrl || deepseekDefaultBaseUrl);
+    const model = String(settings.deepseekModel || "").trim();
+    if (!settings.deepseekApiKey) throw new Error("请先填写 DeepSeek API Key。");
+    if (!model) throw new Error("请先获取并选择 DeepSeek 改写模型。");
+    return { provider, label: "DeepSeek 官方", baseUrl, apiKey: settings.deepseekApiKey, model };
+  }
+  const baseUrl = requireApiConfig(settings);
+  const model = String(settings.model || "").trim();
+  if (!model) throw new Error("请先获取并选择 CPA 改写模型。");
+  return { provider, label: "CPA 反代", baseUrl, apiKey: settings.apiKey, model };
 }
 
 function apiPath(baseUrl, suffix) {
@@ -393,6 +441,239 @@ function parseLastJsonObject(stdout) {
     }
   }
   return {};
+}
+
+function createOcrJob(initial = {}) {
+  const id = randomId();
+  const now = Date.now();
+  const job = {
+    id,
+    status: "queued",
+    phase: "准备 OCR 识别",
+    progress: 0,
+    processed: 0,
+    plannedTotal: 0,
+    currentFrame: 0,
+    frameCount: 0,
+    detections: 0,
+    finalEvents: 0,
+    logs: [],
+    result: null,
+    error: "",
+    child: null,
+    createdAt: now,
+    updatedAt: now,
+    ...initial,
+  };
+  ocrJobs.set(id, job);
+  const cleanupTimer = setTimeout(() => {
+    const latest = ocrJobs.get(id);
+    if (latest?.status !== "running") ocrJobs.delete(id);
+  }, 1000 * 60 * 60);
+  cleanupTimer.unref?.();
+  return job;
+}
+
+function pushOcrLog(job, message) {
+  if (!message) return;
+  job.logs = [...job.logs, String(message)].slice(-80);
+  job.updatedAt = Date.now();
+}
+
+function refreshOcrProgress(job) {
+  const planned = Number(job.plannedTotal || 0);
+  const processed = Number(job.processed || 0);
+  if (planned > 0) {
+    job.progress = Math.max(0, Math.min(99, Math.round((processed / planned) * 100)));
+    return;
+  }
+  const frameCount = Number(job.frameCount || 0);
+  const currentFrame = Number(job.currentFrame || 0);
+  if (frameCount > 0) {
+    job.progress = Math.max(0, Math.min(95, Math.round((currentFrame / frameCount) * 100)));
+  }
+}
+
+function parseOcrProgressLine(job, line) {
+  const text = String(line || "").trim();
+  if (!text || text.startsWith("{")) return;
+  if (text.startsWith("video=")) {
+    const frames = text.match(/\bframes=(\d+)/);
+    const planned = text.match(/\bplanned=(\d+)/);
+    const fps = text.match(/\bfps=([\d.]+)/);
+    const size = text.match(/\bsize=(\d+)x(\d+)/);
+    job.status = "running";
+    job.phase = "正在读取视频帧";
+    job.frameCount = frames ? Number(frames[1]) : job.frameCount;
+    job.plannedTotal = planned ? Number(planned[1]) : job.plannedTotal;
+    job.fps = fps ? Number(fps[1]) : job.fps;
+    if (size) {
+      job.width = Number(size[1]);
+      job.height = Number(size[2]);
+    }
+    refreshOcrProgress(job);
+    pushOcrLog(job, `已读取视频信息，计划识别 ${job.plannedTotal || "-"} 帧。`);
+    return;
+  }
+
+  const progress = text.match(/\bprocessed=(\d+)(?:\s+planned=(\d+))?\s+frame=(\d+)\/(\d+)\s+detections=(\d+)/);
+  if (progress) {
+    job.status = "running";
+    job.phase = "正在逐帧识别字幕";
+    job.processed = Number(progress[1]);
+    if (progress[2]) job.plannedTotal = Number(progress[2]);
+    job.currentFrame = Number(progress[3]);
+    job.frameCount = Number(progress[4]);
+    job.detections = Number(progress[5]);
+    refreshOcrProgress(job);
+    pushOcrLog(job, `已处理 ${job.processed}/${job.plannedTotal || "?"} 帧，发现 ${job.detections} 条文字候选。`);
+    return;
+  }
+
+  const done = text.match(/\bdone processed=(\d+)(?:\s+planned=(\d+))?\s+detections=(\d+)\s+final_events=(\d+)/);
+  if (done) {
+    job.phase = "正在生成字幕文件";
+    job.processed = Number(done[1]);
+    if (done[2]) job.plannedTotal = Number(done[2]);
+    job.detections = Number(done[3]);
+    job.finalEvents = Number(done[4]);
+    job.progress = 99;
+    pushOcrLog(job, `识别完成，正在整理 ${job.finalEvents} 条时间线字幕。`);
+    return;
+  }
+
+  pushOcrLog(job, text);
+}
+
+function publicOcrJob(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    phase: job.phase,
+    progress: job.progress,
+    processed: job.processed,
+    plannedTotal: job.plannedTotal,
+    currentFrame: job.currentFrame,
+    frameCount: job.frameCount,
+    detections: job.detections,
+    finalEvents: job.finalEvents,
+    logs: job.logs,
+    result: job.result,
+    error: job.error,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+  };
+}
+
+async function buildOcrApiResult({ finalOutput, outDir, filePath, runName, mode, sampleInterval, includeWatermark }) {
+  const info = finalOutput.info || await getVideoInfo(filePath).catch(() => null);
+  const visualText = String(finalOutput.text || "").trim();
+  const subtitleCount = Array.isArray(finalOutput.subtitles) ? finalOutput.subtitles.length : 0;
+  const filteredWatermarkCount = Array.isArray(finalOutput.filteredWatermarks) ? finalOutput.filteredWatermarks.length : 0;
+
+  return {
+    visualText,
+    tags: [],
+    mode,
+    sampleInterval,
+    includeWatermark,
+    subtitleCount,
+    filteredWatermarkCount,
+    processed: Number(finalOutput.processed || 0),
+    plannedTotal: Number(finalOutput.plannedTotal || 0),
+    detections: Number(finalOutput.detections || 0),
+    finalEvents: Number(finalOutput.finalEvents || subtitleCount),
+    info,
+    artifacts: {
+      srt: publicOcrUrl(runName, finalOutput.srtFile || "subtitles.srt"),
+    },
+    fileStatus: {
+      srt: await fileIfExists(path.join(outDir, finalOutput.srtFile || "subtitles.srt")),
+    },
+  };
+}
+
+function startOcrJob(job, { args, outDir, filePath, runName, mode, sampleInterval, includeWatermark }) {
+  job.status = "running";
+  job.phase = "启动 OCR 引擎";
+  pushOcrLog(job, "OCR 任务已开始。");
+
+  const child = spawn("python", args, {
+    cwd: rootDir,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  job.child = child;
+
+  let stdout = "";
+  let stderr = "";
+  let stdoutBuffer = "";
+  let stderrBuffer = "";
+  let settled = false;
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    stdoutBuffer += chunk;
+    const lines = stdoutBuffer.split(/\r?\n/);
+    stdoutBuffer = lines.pop() || "";
+    for (const line of lines) parseOcrProgressLine(job, line);
+  });
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+    stderrBuffer += chunk;
+    const lines = stderrBuffer.split(/\r?\n/);
+    stderrBuffer = lines.pop() || "";
+    for (const line of lines) pushOcrLog(job, line);
+  });
+
+  child.on("error", (error) => {
+    if (settled) return;
+    settled = true;
+    job.status = "error";
+    job.phase = "OCR 启动失败";
+    job.error = error.message;
+    pushOcrLog(job, `OCR 启动失败：${error.message}`);
+  });
+
+  child.on("close", async (code) => {
+    if (stdoutBuffer) parseOcrProgressLine(job, stdoutBuffer);
+    if (stderrBuffer) pushOcrLog(job, stderrBuffer);
+    if (settled) return;
+    settled = true;
+
+    if (code !== 0) {
+      job.status = "error";
+      job.phase = "OCR 识别失败";
+      job.error = stderr.trim() || `OCR 进程退出，代码 ${code}`;
+      job.progress = Math.max(job.progress || 0, 1);
+      pushOcrLog(job, job.error);
+      return;
+    }
+
+    try {
+      const output = parseLastJsonObject(stdout);
+      const resultPath = path.join(outDir, "result.json");
+      const fileOutput = await readJson(resultPath, output);
+      const finalOutput = Object.keys(fileOutput || {}).length ? fileOutput : output;
+      job.result = await buildOcrApiResult({ finalOutput, outDir, filePath, runName, mode, sampleInterval, includeWatermark });
+      job.status = "done";
+      job.phase = "OCR 识别完成";
+      job.progress = 100;
+      job.processed = job.result.processed || job.processed;
+      job.plannedTotal = job.result.plannedTotal || job.plannedTotal;
+      job.detections = job.result.detections || job.detections;
+      job.finalEvents = job.result.finalEvents || job.finalEvents;
+      pushOcrLog(job, `已生成 ${job.result.subtitleCount || 0} 条时间线字幕。`);
+    } catch (error) {
+      job.status = "error";
+      job.phase = "OCR 结果整理失败";
+      job.error = error.message;
+      pushOcrLog(job, `OCR 结果整理失败：${error.message}`);
+    }
+  });
 }
 
 function extractFirstHttpUrl(input) {
@@ -1475,13 +1756,21 @@ app.post("/api/settings", async (req, res) => {
     const current = await getSettings();
     const next = {
       ...current,
+      activeAiProvider: req.body.activeAiProvider === "deepseek" ? "deepseek" : "cpa",
       baseUrl: String(req.body.baseUrl || "").trim(),
+      deepseekBaseUrl: normalizeBaseUrl(req.body.deepseekBaseUrl || current.deepseekBaseUrl || deepseekDefaultBaseUrl),
+      deepseekModel: String(req.body.deepseekModel || "").trim(),
       model: String(req.body.model || "").trim(),
       transcriptionModel: normalizeTranscriptionModel(req.body.transcriptionModel || current.transcriptionModel),
+      asrSimplifiedOnly: Boolean(req.body.asrSimplifiedOnly),
       models: Array.isArray(req.body.models) ? req.body.models : current.models || [],
+      deepseekModels: Array.isArray(req.body.deepseekModels) ? req.body.deepseekModels : current.deepseekModels || [],
     };
     if (typeof req.body.apiKey === "string" && req.body.apiKey.trim()) {
       next.apiKey = req.body.apiKey.trim();
+    }
+    if (typeof req.body.deepseekApiKey === "string" && req.body.deepseekApiKey.trim()) {
+      next.deepseekApiKey = req.body.deepseekApiKey.trim();
     }
     if (typeof req.body.douyinCookie === "string" && req.body.douyinCookie.trim()) {
       next.douyinCookie = req.body.douyinCookie.trim();
@@ -1498,18 +1787,21 @@ app.post("/api/settings", async (req, res) => {
 app.post("/api/models", async (req, res) => {
   try {
     const current = await getSettings();
-    const baseUrl = normalizeBaseUrl(req.body.baseUrl || current.baseUrl);
-    const apiKey = String(req.body.apiKey || current.apiKey || "").trim();
-    if (!baseUrl) throw new Error("请先填写 CPA Base URL。");
-    if (!apiKey) throw new Error("请先填写 CPA API Key。");
+    const provider = req.body.provider === "deepseek" ? "deepseek" : "cpa";
+    const baseUrl = provider === "deepseek"
+      ? normalizeBaseUrl(req.body.baseUrl || current.deepseekBaseUrl || deepseekDefaultBaseUrl)
+      : normalizeBaseUrl(req.body.baseUrl || current.baseUrl);
+    const apiKey = String(req.body.apiKey || (provider === "deepseek" ? current.deepseekApiKey : current.apiKey) || "").trim();
+    if (!baseUrl) throw new Error(provider === "deepseek" ? "请先填写 DeepSeek Base URL。" : "请先填写 CPA Base URL。");
+    if (!apiKey) throw new Error(provider === "deepseek" ? "请先填写 DeepSeek API Key。" : "请先填写 CPA API Key。");
     const data = await fetchJsonOrThrow(apiPath(baseUrl, "/models"), {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
     const models = Array.isArray(data.data)
       ? data.data.map((item) => item.id || item.name).filter(Boolean)
       : [];
-    if (!models.length) throw new Error("模型接口返回为空，请检查 Base URL 是否兼容 OpenAI /v1。");
-    res.json({ models });
+    if (!models.length) throw new Error("模型接口返回为空，请检查 Base URL 和 API Key。");
+    res.json({ provider, models });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
@@ -1689,7 +1981,7 @@ app.post("/api/extract-subtitles", async (req, res) => {
       "--sample-interval",
       String(sampleInterval),
       "--progress-every",
-      "200",
+      "20",
     ];
     if (includeWatermark) args.push("--include-watermark");
 
@@ -1703,30 +1995,60 @@ app.post("/api/extract-subtitles", async (req, res) => {
     const resultPath = path.join(outDir, "result.json");
     const fileOutput = await readJson(resultPath, output);
     const finalOutput = Object.keys(fileOutput || {}).length ? fileOutput : output;
-    const info = finalOutput.info || await getVideoInfo(filePath).catch(() => null);
-    const visualText = String(finalOutput.text || "").trim();
-    const subtitleCount = Array.isArray(finalOutput.subtitles) ? finalOutput.subtitles.length : 0;
-    const filteredWatermarkCount = Array.isArray(finalOutput.filteredWatermarks) ? finalOutput.filteredWatermarks.length : 0;
-
-    res.json({
-      visualText,
-      tags: [],
-      mode,
-      sampleInterval,
-      includeWatermark,
-      subtitleCount,
-      filteredWatermarkCount,
-      info,
-      artifacts: {
-        srt: publicOcrUrl(runName, finalOutput.srtFile || "subtitles.srt"),
-      },
-      fileStatus: {
-        srt: await fileIfExists(path.join(outDir, finalOutput.srtFile || "subtitles.srt")),
-      },
-    });
+    res.json(await buildOcrApiResult({ finalOutput, outDir, filePath, runName, mode, sampleInterval, includeWatermark }));
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
+});
+
+app.post("/api/extract-subtitles/start", async (req, res) => {
+  try {
+    const record = await findMediaRecord(String(req.body.mediaId || ""));
+    if (!record) throw new Error("找不到已上传或已解析的视频。");
+    if (!(await fileIfExists(videoOcrScript))) {
+      throw new Error("工具内置 OCR 脚本缺失。");
+    }
+
+    const mode = req.body.mode === "every-frame" ? "every-frame" : "interval";
+    const sampleInterval = Math.max(0.05, Math.min(30, Number(req.body.sampleInterval) || 0.25));
+    const includeWatermark = Boolean(req.body.includeWatermark);
+    const runName = `${Date.now()}-${record.id}-ocr`;
+    const outDir = path.join(ocrRunDir, runName);
+    const filePath = path.join(uploadDir, record.fileName);
+    const args = [
+      videoOcrScript,
+      filePath,
+      "--output-dir",
+      outDir,
+      "--mode",
+      mode,
+      "--sample-interval",
+      String(sampleInterval),
+      "--progress-every",
+      "20",
+    ];
+    if (includeWatermark) args.push("--include-watermark");
+
+    const job = createOcrJob({
+      mode,
+      sampleInterval,
+      includeWatermark,
+      runName,
+    });
+    startOcrJob(job, { args, outDir, filePath, runName, mode, sampleInterval, includeWatermark });
+    res.json(publicOcrJob(job));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/extract-subtitles/status/:jobId", (req, res) => {
+  const job = ocrJobs.get(String(req.params.jobId || ""));
+  if (!job) {
+    res.status(404).json({ error: "找不到 OCR 任务记录，请重新开始识别。" });
+    return;
+  }
+  res.json(publicOcrJob(job));
 });
 
 app.post("/api/analyze-frames", async (req, res) => {
@@ -1798,7 +2120,51 @@ function normalizeRemoteTranscriptionModel(model) {
   return value;
 }
 
-async function transcribeWithLocal(record, requestedModel) {
+function srtTime(seconds) {
+  const msTotal = Math.max(0, Math.round(Number(seconds || 0) * 1000));
+  const hours = Math.floor(msTotal / 3600000);
+  const minutes = Math.floor((msTotal % 3600000) / 60000);
+  const secondsPart = Math.floor((msTotal % 60000) / 1000);
+  const ms = msTotal % 1000;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(secondsPart).padStart(2, "0")},${String(ms).padStart(3, "0")}`;
+}
+
+async function writeAsrArtifacts(outDir, segments, transcript, srtFile = "subtitles.srt", textFile = "transcript.txt") {
+  await fsp.writeFile(path.join(outDir, textFile), transcript, "utf8");
+  const lines = [];
+  for (const [index, segment] of segments.entries()) {
+    const text = String(segment.text || "").trim();
+    if (!text) continue;
+    lines.push(
+      String(index + 1),
+      `${srtTime(segment.start)} --> ${srtTime(segment.end)}`,
+      text,
+      "",
+    );
+  }
+  await fsp.writeFile(path.join(outDir, srtFile), lines.join("\n"), "utf8");
+}
+
+function convertTranscriptToSimplified(result) {
+  const segments = Array.isArray(result.segments)
+    ? result.segments.map((segment) => ({ ...segment, text: toSimplifiedChinese(String(segment.text || "")) }))
+    : [];
+  return {
+    ...result,
+    text: toSimplifiedChinese(String(result.text || "")),
+    segments,
+    convertedToSimplified: true,
+  };
+}
+
+function convertTextByOutputLanguage(text, outputLanguage) {
+  const value = String(text || "");
+  if (outputLanguage === "简体中文") return toSimplifiedChinese(value);
+  if (outputLanguage === "繁体中文") return toTraditionalChinese(value);
+  return value;
+}
+
+async function transcribeWithLocal(record, requestedModel, options = {}) {
   if (!(await fileIfExists(transcriptionScript))) {
     throw new Error("工具内置本地语音识别脚本缺失。");
   }
@@ -1827,7 +2193,7 @@ async function transcribeWithLocal(record, requestedModel) {
   const finalOutput = Object.keys(fileOutput || {}).length ? fileOutput : output;
   const srtFile = finalOutput.srtFile || "subtitles.srt";
   const textFile = finalOutput.textFile || "transcript.txt";
-  return {
+  let resultData = {
     text: String(finalOutput.text || "").trim(),
     segments: Array.isArray(finalOutput.segments) ? finalOutput.segments : [],
     segmentCount: Number(finalOutput.segmentCount || 0),
@@ -1845,9 +2211,14 @@ async function transcribeWithLocal(record, requestedModel) {
       text: await fileIfExists(path.join(outDir, textFile)),
     },
   };
+  if (options.simplifiedOnly) {
+    resultData = convertTranscriptToSimplified(resultData);
+    await writeAsrArtifacts(outDir, resultData.segments, resultData.text, srtFile, textFile);
+  }
+  return resultData;
 }
 
-async function transcribeWithRemote(record, requestedModel, settings) {
+async function transcribeWithRemote(record, requestedModel, settings, options = {}) {
   const baseUrl = requireApiConfig(settings);
   const filePath = path.join(uploadDir, record.fileName);
   const buffer = await fsp.readFile(filePath);
@@ -1878,12 +2249,14 @@ async function transcribeWithRemote(record, requestedModel, settings) {
   if (!response.ok) {
     throw new Error(data?.error?.message || data?.message || text || "语音识别请求失败。");
   }
+  const textValue = String(data.text || "").trim();
   return {
-    text: String(data.text || "").trim(),
+    text: options.simplifiedOnly ? toSimplifiedChinese(textValue) : textValue,
     segments: [],
     segmentCount: 0,
     model: normalizeRemoteTranscriptionModel(requestedModel),
     engine: "CPA 音频转写",
+    convertedToSimplified: Boolean(options.simplifiedOnly),
     raw: data,
   };
 }
@@ -1894,10 +2267,11 @@ app.post("/api/transcribe-media", async (req, res) => {
     const record = await findMediaRecord(String(req.body.mediaId || ""));
     if (!record) throw new Error("找不到已上传或已解析的视频。");
     const requestedModel = normalizeTranscriptionModel(req.body.model || settings.transcriptionModel);
+    const simplifiedOnly = Boolean(settings.asrSimplifiedOnly || req.body.simplifiedOnly);
 
     let localError = null;
     try {
-      res.json(await transcribeWithLocal(record, requestedModel));
+      res.json(await transcribeWithLocal(record, requestedModel, { simplifiedOnly }));
       return;
     } catch (error) {
       localError = error;
@@ -1905,7 +2279,7 @@ app.post("/api/transcribe-media", async (req, res) => {
 
     if (hasRemoteTranscriptionConfig(settings)) {
       try {
-        res.json(await transcribeWithRemote(record, requestedModel, settings));
+        res.json(await transcribeWithRemote(record, requestedModel, settings, { simplifiedOnly }));
         return;
       } catch (remoteError) {
         throw new Error(`本地语音识别失败：${summarizeAsrError(localError)}；CPA 兜底也失败：${summarizeAsrError(remoteError)}`);
@@ -1921,16 +2295,17 @@ app.post("/api/transcribe-media", async (req, res) => {
 app.post("/api/rewrite", async (req, res) => {
   try {
     const settings = await getSettings();
-    const baseUrl = requireApiConfig(settings);
-    const model = String(req.body.model || settings.model || "").trim();
-    if (!model) throw new Error("请先获取并选择 CPA 模型。");
+    const aiConfig = getRewriteApiConfig(settings, req.body.provider);
+    const model = String(req.body.model || aiConfig.model || "").trim();
+    if (!model) throw new Error(`请先获取并选择 ${aiConfig.label} 改写模型。`);
     const sourceText = String(req.body.text || "").trim();
     if (!sourceText) throw new Error("没有可改写的真实文案。请先完成语音识别或 OCR 识别。");
     const lengthMode = String(req.body.lengthMode || "标准");
-    const data = await fetchJsonOrThrow(apiPath(baseUrl, "/chat/completions"), {
+    const outputLanguage = String(req.body.outputLanguage || "简体中文").trim() || "简体中文";
+    const data = await fetchJsonOrThrow(apiPath(aiConfig.baseUrl, "/chat/completions"), {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${settings.apiKey}`,
+        Authorization: `Bearer ${aiConfig.apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -1939,14 +2314,26 @@ app.post("/api/rewrite", async (req, res) => {
         messages: [
           {
             role: "system",
-            content: "你是短视频爆款文案改写专家。只基于用户提供的原文改写，不添加不存在的事实、收入承诺或虚假案例。",
+            content: [
+              "你是严谨的短视频文案校对与改写专家。",
+              "所有输出都必须只基于用户提供的原文，不添加不存在的事实、收入承诺、人物关系、案例或结论。",
+              "无论输出长度和版本类型如何，都不能改变原文意思；标点、断句不能造成语义变化。",
+              "原文整理版只能修明显错字、补标点、调整断句、统一目标语言，不得替换不顺口的词，不得改写句式，不得新增表达。",
+              "原文整理版需要结合上下文、常见固定表达、成语俗语、屏幕字幕线索，修复明显的同音字、近音字、形近字和 OCR/ASR 识别错字。",
+              "如果无法从上下文确认正确写法，必须保留原文，不要凭空润色或猜测。",
+            ].join("\n"),
           },
           {
             role: "user",
             content: [
+              `输出语言：${outputLanguage}`,
               `输出长度：${lengthMode}`,
               "请输出 JSON 数组，固定 3 项，每项包含 name、tone、text。",
               "三版分别是：原文整理版、爆款口播版、强转化版。",
+              "原文整理版规则：尽可能与原文一字一致，只修复识别错字、标点、断句和简繁/语言格式；不能把词换成近义词。",
+              "原文整理版纠错优先级：先看整段上下文和语义，再看常见表达，最后看同音/近音/OCR 错字。例如语义是“任何地方都可以学习、任何人事物都可以成为老师”时，世间处处皆是无失/无矢/无师 应修为 世间处处皆是吾师。",
+              "爆款口播版规则：可以换一种更顺口的说法，但必须保持原意、事实和语气边界。",
+              "强转化版规则：可以增强表达吸引力，但必须保持原意，不能制造夸张承诺或改变语义。",
               `原文：${sourceText}`,
             ].join("\n"),
           },
@@ -1965,7 +2352,7 @@ app.post("/api/rewrite", async (req, res) => {
       .map((item, index) => ({
         name: String(item.name || `版本 ${index + 1}`),
         tone: String(item.tone || "改写结果"),
-        text: String(item.text || "").trim(),
+        text: convertTextByOutputLanguage(String(item.text || "").trim(), outputLanguage),
       }))
       .filter((item) => item.text)
       .slice(0, 3);

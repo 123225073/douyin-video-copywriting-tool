@@ -331,10 +331,12 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     duration = frame_count / fps if frame_count and fps else 0.0
     planned_frames = frame_plan(duration, fps, frame_count, args.mode, args.sample_interval)
+    planned_total = len(planned_frames)
+    progress_every = max(1, min(max(1, args.progress_every), max(1, planned_total // 50 or 1)))
     ocr = RapidOCR()
     records = []
     processed = 0
-    print(f"video={args.video} frames={frame_count} fps={fps:.3f} size={width}x{height} mode={args.mode}", flush=True)
+    print(f"video={args.video} frames={frame_count} planned={planned_total} fps={fps:.3f} size={width}x{height} mode={args.mode}", flush=True)
     frame_iter = enumerate_sequential_frames(cap, planned_frames) if args.mode == "every-frame" else enumerate_seeked_frames(cap, planned_frames)
     for frame_no, frame in frame_iter:
         result, _ = ocr(frame)
@@ -362,8 +364,8 @@ def main():
                     }
                 )
         processed += 1
-        if processed % args.progress_every == 0:
-            print(f"processed={processed} frame={frame_no}/{frame_count} detections={len(records)}", flush=True)
+        if processed % progress_every == 0 or processed == planned_total:
+            print(f"processed={processed} planned={planned_total} frame={frame_no}/{frame_count} detections={len(records)}", flush=True)
     cap.release()
 
     filtered = [record for record in records if record["conf"] >= args.min_conf]
@@ -398,6 +400,7 @@ def main():
         ],
         "filteredWatermarks": sorted(watermark_norms),
         "processed": processed,
+        "plannedTotal": planned_total,
         "detections": len(records),
         "finalEvents": len(events),
         "info": {
@@ -410,7 +413,7 @@ def main():
         "srtFile": srt_name,
     }
     (out_dir / "result.json").write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"done processed={processed} detections={len(records)} final_events={len(events)}", flush=True)
+    print(f"done processed={processed} planned={planned_total} detections={len(records)} final_events={len(events)}", flush=True)
     print(json.dumps(output, ensure_ascii=False), flush=True)
 
 

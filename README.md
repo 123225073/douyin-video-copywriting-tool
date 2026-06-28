@@ -1,6 +1,6 @@
 # Douyin Video Copywriting Tool
 
-一个本地运行的抖音视频解析、文案提取、SRT 字幕生成和 AI 改写工具。适合短视频拆解、爆款文案复刻、素材整理和 CPA/OpenAI 兼容模型接入。
+一个本地运行的抖音视频解析、文案提取、SRT 字幕生成和 AI 改写工具。适合短视频拆解、爆款文案复刻、素材整理，以及 CPA/OpenAI 兼容接口或 DeepSeek 官方接口接入。
 
 ## 核心能力
 
@@ -14,7 +14,11 @@
 - 水印过滤：尽量排除 Logo、水印、平台标识等无关区域，减少误识别。
 - 文案整理：自动去重、合并、清洗识别结果。
 - SRT 导出：生成带时间线的字幕文件。
-- AI 改写：支持配置 CPA/OpenAI 兼容接口，选择模型后改写整条文案。
+- AI 改写：支持配置 CPA/OpenAI 兼容接口或 DeepSeek 官方接口，选择模型后改写整条文案。
+- 原文校对：原文整理版会结合上下文修正常见同音、近音、OCR/ASR 识别错误，并尽量保持原意不变。
+- 刷新保留：当前任务会保存在浏览器本地缓存，刷新页面不会丢失识别和改写结果。
+- 一键重置：用户主动点击“重置”后，才会清空当前任务缓存。
+- 进度面板：抖音解析和 OCR 识别提供可关闭、可重新打开的进度查看入口。
 
 ## 适用场景
 
@@ -30,7 +34,7 @@
 - 视频处理：Python + OpenCV
 - OCR：RapidOCR
 - ASR：faster-whisper
-- AI 接口：CPA/OpenAI 兼容接口
+- AI 接口：CPA/OpenAI 兼容接口、DeepSeek 官方接口
 
 ## 目录结构
 
@@ -123,12 +127,18 @@ http://127.0.0.1:5176/
 5. 开始识别视频文案。
 6. 查看整理后的文案结果。
 7. 按需导出 SRT 字幕。
-8. 在设置里填写 Base URL、API Key，获取模型并保存。
+8. 在设置里选择 CPA 或 DeepSeek，填写 Base URL、API Key，获取模型并保存。
 9. 选择模型后进行 AI 改写。
+10. 如果需要重新开始，点击顶部“重置”清空当前任务。
 
-## CPA / AI 模型配置
+## AI 模型配置
 
-工具支持 OpenAI 兼容接口，配置项包括：
+工具支持两类改写模型接入：
+
+- CPA/OpenAI 兼容接口
+- DeepSeek 官方接口
+
+配置项包括：
 
 - Base URL
 - API Key
@@ -136,6 +146,8 @@ http://127.0.0.1:5176/
 - 当前使用模型
 
 配置保存在本地，不会提交到 GitHub。
+
+DeepSeek 设置区提供 API Key 申请入口，方便用户跳转到官方平台获取密钥。
 
 ## 本地数据说明
 
@@ -147,6 +159,7 @@ http://127.0.0.1:5176/
 - OCR 中间结果
 - AI 接口配置
 - 字幕导出结果
+- 浏览器本地任务缓存，包括当前视频信息、识别文案、AI 改写结果和页面状态
 
 这些内容保存在：
 
@@ -176,7 +189,9 @@ prototype/local-data/
 - 后端快速抽帧已接入。
 - 本地视频上传入口已接入。
 - 本地语音识别、OCR 文案识别和 SRT 生成已接入。
-- CPA/OpenAI 兼容模型配置入口已接入。
+- CPA/OpenAI 兼容模型和 DeepSeek 官方模型配置入口已接入。
+- 页面刷新保留缓存、一键重置、下拉框对比色优化已验证。
+- OCR 识别进度面板和识别结果回填已接入。
 
 ## 已知限制
 
@@ -192,5 +207,5 @@ prototype/local-data/
 | --- | --- |
 | Repository | `123225073/douyin-video-copywriting-tool` |
 | Visibility | Public |
-| Description | 本地运行的抖音视频解析、字幕/OCR 文案提取、SRT 生成与 CPA AI 改写工具。 |
+| Description | 本地运行的抖音视频解析、字幕/OCR 文案提取、SRT 生成与 CPA/DeepSeek AI 改写工具。 |
 | Topics | `douyin`, `video-downloader`, `ocr`, `subtitle-extraction`, `srt`, `ai-copywriting`, `react`, `express`, `opencv`, `rapidocr`, `local-tool` |
