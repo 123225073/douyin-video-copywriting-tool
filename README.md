@@ -41,12 +41,16 @@
 ```text
 .
 ├── README.md
+├── start-windows.bat
+├── tools/
+│   └── start-windows.ps1
 ├── docs/
 │   ├── design-directions/
 │   └── superpowers/
 ├── prototype/
 │   ├── server.mjs
 │   ├── package.json
+│   ├── requirements.txt
 │   ├── src/
 │   └── scripts/
 │       ├── extract_frames.py
@@ -57,14 +61,15 @@
 
 ## 环境要求
 
-- Node.js
-- Python 3
+- Windows 10/11
 - Chrome 或 Edge 浏览器
-- Python 依赖：
+- 首次启动需要联网安装依赖
+- 如果电脑没有 Node.js 或 Python 3，一键启动脚本会优先尝试自动安装；如果自动安装失败，会打开官方下载页面。
 
-```bash
-pip install opencv-python rapidocr_onnxruntime faster-whisper
-```
+本地识别依赖会由一键启动脚本自动安装：
+
+- Node.js 依赖
+- Python 依赖：`opencv-python`、`rapidocr_onnxruntime`、`faster-whisper`、`yt-dlp`
 
 首次运行本地语音识别时，`faster-whisper` 会下载模型；如果要打包给他人离线使用，需要提前准备模型缓存。
 
@@ -80,7 +85,28 @@ pip install opencv-python rapidocr_onnxruntime faster-whisper
 
 工具的 AI 设置页里有“检测配置”按钮，可自动给出推荐模型。
 
-## 安装和启动
+## 一键安装和启动
+
+推荐给普通用户使用这个方式。
+
+1. 打开 GitHub 仓库页面。
+2. 点击绿色 `Code` 按钮。
+3. 点击 `Download ZIP`。
+4. 解压 ZIP 文件。
+5. 双击根目录里的 `start-windows.bat`。
+6. 等待自动安装和启动，浏览器会自动打开：
+
+```text
+http://127.0.0.1:5176/
+```
+
+第一次启动会慢一些，因为要安装 Node 依赖、Python 识别依赖，并下载本地语音识别模型。后续再次双击启动会快很多。
+
+使用时请保持启动窗口打开；关闭窗口或按回车停止后，本地服务会退出。
+
+## 手动启动方式
+
+如果你是开发者，也可以手动启动。
 
 进入应用目录：
 
@@ -88,10 +114,11 @@ pip install opencv-python rapidocr_onnxruntime faster-whisper
 cd prototype
 ```
 
-安装前端和后端依赖：
+安装依赖：
 
 ```bash
 npm install
+pip install -r requirements.txt
 ```
 
 构建前端：
@@ -148,6 +175,34 @@ http://127.0.0.1:5176/
 配置保存在本地，不会提交到 GitHub。
 
 DeepSeek 设置区提供 API Key 申请入口，方便用户跳转到官方平台获取密钥。
+
+## 线上部署建议
+
+这个工具不是纯静态网页，它需要后端长期运行，并且会处理视频文件、OCR、语音识别、本地模型和后台进度任务。
+
+不建议直接把完整功能部署到 Vercel 或 Cloudflare Workers：
+
+- Vercel / Cloudflare 更适合前端页面、轻量 API、官网或演示页。
+- 本工具的完整功能需要 Python、OpenCV、RapidOCR、faster-whisper、yt-dlp、临时视频文件和较长运行时间。
+- 上传视频、OCR 全帧识别、语音模型加载、抖音解析等任务，放在 Serverless / Edge 环境里容易超时、丢文件或无法安装依赖。
+
+如果要让别人直接在线使用完整功能，推荐部署到一台云服务器 / VPS / 容器服务器。
+
+建议服务器配置：
+
+| 用途 | 推荐配置 |
+| --- | --- |
+| 轻量测试 | 2 核 CPU / 4GB 内存 / 40GB 磁盘 |
+| 正常商用体验 | 4 核 CPU / 8GB 内存 / 80GB 磁盘 |
+| 更快语音识别 | NVIDIA 显卡服务器，或改接第三方语音识别 API |
+
+继续部署线上版时，需要准备：
+
+- 云服务器 IP
+- SSH 登录用户和密钥，或临时密码
+- 域名，如果需要绑定正式访问地址
+- 是否允许服务器保存用户上传的视频和识别结果
+- 是否要关闭本地 faster-whisper，改用第三方语音识别 API，降低服务器压力
 
 ## 本地数据说明
 

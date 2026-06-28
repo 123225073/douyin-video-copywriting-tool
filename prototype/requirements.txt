@@ -1,0 +1,4 @@
+opencv-python
+rapidocr_onnxruntime
+faster-whisper
+yt-dlp
